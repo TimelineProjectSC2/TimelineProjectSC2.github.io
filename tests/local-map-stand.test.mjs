@@ -886,3 +886,139 @@ test('W23: m.8 = 3…8 % на суше, m.9 ≥ 1 % минимум в 30 из 40
   console.log(`W23: морские окна m.9 ≥ 1 %: ${passed}/40`);
   assert.ok(passed >= 30, `m.9: ${passed}/40 морских пятен ≥ 1 %; остаток ${failures.join(', ')}`);
 });
+
+// W23b: планетное поле сглажено на 65², но коротковолновый detail остаётся
+// поформенным. Это отдельный регрессионный контроль ДО/ПОСЛЕ интерполяции:
+// та же пара, тот же физический dir и один и тот же seed.
+test('W23b: 65² планетная решётка меняет m.13 не более чем на 0,05 м на #37488↔#37519', () => {
+  const grid = GeodesicGrid.build(stand.CANONICAL_V);
+  const surface = PlanetSurface.generateSurface(grid, stand.WORLDS.a29.profile);
+  const patchA = Contract.buildPatch7(grid, surface, 37488);
+  const patchB = Contract.buildPatch7(grid, surface, 37519);
+  const R = stand.DEFAULT_RADIUS_M;
+  const res = Worker.HEIGHTFIELD_RES, stepM = 2 * R / res;
+  const seed = (stand.WORLDS.a29.seed ^ Math.imul(3, 0x85EBCA6B)) >>> 0;
+  let maxFieldDelta = 0;
+  const make = (patch) => {
+    const direct = new Float32Array(res * res);
+    const lattice = new Float32Array(res * res);
+    const field = Heightfield.sampleElevationLattice(patch, R, stepM);
+    for (let y = 0; y < res; y++) {
+      for (let x = 0; x < res; x++) {
+        const dir = Contract.localPointToDirection(patch, (x - res / 2) * stepM, (y - res / 2) * stepM);
+        const elevation = PlanetElevationField.sampleElevation(dir, stepM);
+        const interpolated = Heightfield.elevationFromLattice(field, 64, x / 4, y / 4);
+        if (patch === patchA) maxFieldDelta = Math.max(maxFieldDelta, Math.abs(elevation - interpolated));
+        const detail = Heightfield.sampleLocalTerrainDetailM(dir, patch.frame.radiusM, seed, true);
+        direct[y * res + x] = elevation + detail;
+        lattice[y * res + x] = interpolated + detail;
+      }
+    }
+    return { direct, lattice };
+  };
+  const a = make(patchA), b = make(patchB);
+  const view = (patch, heightfield) => ({ patch, local: { heightfield, meta: { radiusM: R, hfRes: res } } });
+  const directSeam = stand.measureHexContinuity(view(patchA, a.direct).local, patchA,
+    new Map([[patchB.centerCell, view(patchB, b.direct)]]), R);
+  const latticeSeam = stand.measureHexContinuity(view(patchA, a.lattice).local, patchA,
+    new Map([[patchB.centerCell, view(patchB, b.lattice)]]), R);
+  console.log(`W23b: поле вершины vs решётка #37488 max=${maxFieldDelta.toFixed(4)} м; `
+    + `m.13 #37488↔#37519 ${directSeam.value.toFixed(4)} → ${latticeSeam.value.toFixed(4)} м`);
+  assert.ok(Math.abs(directSeam.value - latticeSeam.value) <= 0.05,
+    `добавка решётки в m.13 = ${Math.abs(directSeam.value - latticeSeam.value).toFixed(4)} м <= 0,05 м`);
+});
+
+test('W23b: численное разложение худшей грани m.13 восстанавливает именно измеренный шов', () => {
+  const d = report.seamDiagnostic;
+  assert.ok(d && d.cellA !== d.cellB);
+  const worst = report.rows.filter((r) => r.metric === stand.METRIC_TITLES.hexContinuity)
+    .reduce((a, b) => (a.value > b.value ? a : b));
+  assert.equal(d.cellA, worst.cell);
+  assert.ok(Math.abs(d.measuredM - worst.value) <= 0.0005, 'число m.13 округлено в строке таблицы');
+  assert.ok(Math.abs(Math.abs(d.signedHeightDifferenceM) - d.measuredM) < 1e-6);
+  const { field, detail, carve, lake, classification, directFieldAtDir } = d.componentsM;
+  for (const term of [field, detail, carve, lake, classification, directFieldAtDir]) {
+    assert.ok(Number.isFinite(term));
+  }
+  assert.ok(Math.abs(field + detail + carve + lake + classification - d.signedHeightDifferenceM) < 1e-6);
+  assert.ok(Math.abs(directFieldAtDir) < 1e-6, 'прямое поле в одном физическом dir совпадает');
+  for (const side of [d.perSideM.A, d.perSideM.B]) {
+    assert.ok(Math.abs(side.field + side.detail + side.carve + side.lake - side.final) < 1e-6);
+  }
+});
+
+// Содержательная замена старого И-3.2 №14 живёт только здесь: запрещённый
+// tests/local-map-stage8.test.mjs по-прежнему проверяет канонический filledElevation.
+// ВАЖНО: до fBm/вреза центр планетного слоя совпадает с sampleElevation до
+// 1e-6; итоговый Float32 heightfield содержит ещё общую мировую деталь и,
+// при наличии реки/озера, гидрологию. Нельзя ложно сравнивать его с одним
+// sampleElevation как будто этих слоёв нет.
+test('W23b И-3.2: планетный слой в центре = sampleElevation(centerDir), море = 0 м относительно seaLevel', async () => {
+  const grid = GeodesicGrid.build(stand.CANONICAL_V);
+  const surface = PlanetSurface.generateSurface(grid, stand.WORLDS.a29.profile);
+  const ocean = Contract.buildPatch7(grid, surface, 37488);
+  assert.ok(Contract.isWaterCell(ocean.cells[0], ocean.seaLevel));
+  assert.equal(Contract.waterLevelOf(ocean.cells[0], ocean.seaLevel) - ocean.seaLevel, 0,
+    'канонический уровень океана становится нулём метрического heightfield');
+
+  const cell = report.landSample.rows.map((r) => r.cell).find((id) => {
+    const candidate = Contract.buildPatch7(grid, surface, id);
+    const outlet = candidate.river.outlet && candidate.cells[candidate.river.outlet.slot + 1];
+    return !candidate.river.flowsThroughCenter && candidate.river.inlets.length === 0
+      && (!outlet || !Contract.isWaterCell(outlet, candidate.seaLevel));
+  });
+  assert.ok(cell !== undefined, 'в детерминированной выборке найдена сухая ячейка без русла');
+  const patch = Contract.buildPatch7(grid, surface, cell);
+  const R = stand.DEFAULT_RADIUS_M;
+  const res = Worker.HEIGHTFIELD_RES, center = (res / 2) * res + res / 2;
+  const stepM = 2 * R / res;
+  const dir = patch.frame.origin;
+  const direct = PlanetElevationField.sampleElevation(dir, stepM);
+  const lattice = Heightfield.sampleElevationLattice(patch, R, stepM);
+  assert.equal(lattice.length, 65 * 65, 'планетное поле выбирается в 4225 узлах');
+  assert.ok(Math.abs(lattice[32 * 65 + 32] - direct) < 1e-6,
+    'центральный узел планетного слоя совпадает с прямым сэмплом');
+  assert.ok(Math.abs(Heightfield.elevationFromLattice(lattice, 64, 32, 32) - direct) < 1e-6);
+
+  const seed = (stand.WORLDS.a29.seed ^ Math.imul(3, 0x85EBCA6B)) >>> 0;
+  const detail = Heightfield.sampleLocalTerrainDetailM(dir, patch.frame.radiusM, seed, true);
+  const base = Heightfield.buildBaseHeightfield(patch, R, seed, new Uint8Array(res * res), true);
+  assert.ok(Math.abs(base.heightM[center] - detail - direct) < 1e-6,
+    'центральный планетный слой до детали/вреза равен sampleElevation');
+  const local = await Worker.generateLocalMap({
+    patch, seed: stand.WORLDS.a29.seed, placeId: 2, radiusM: R,
+    profile: stand.WORLDS.a29.profile, neighborRings: 0,
+  });
+  assert.equal(local.heightfield[center], Math.fround(base.heightM[center]),
+    'итоговый Float32 = планетное поле + мировая деталь, без патч-зависимого якоря');
+});
+
+test('W23b: --land-cells=20 выбирает фиксированные наземные центры и честно считает медиану/p10/p90 m.8/m.10', () => {
+  const sample = report.landSample;
+  assert.equal(sample.requested, 20);
+  assert.equal(sample.selected, 20);
+  assert.equal(sample.rows.length, 20);
+  assert.equal(new Set(sample.rows.map((r) => r.cell)).size, 20);
+  const grid = GeodesicGrid.build(stand.CANONICAL_V);
+  const surface = PlanetSurface.generateSurface(grid, stand.WORLDS.a29.profile);
+  assert.deepEqual(stand.selectLandCells(grid, surface, stand.WORLDS.a29.seed, 20),
+    sample.rows.map((r) => r.cell));
+  for (const r of sample.rows) {
+    assert.ok(surface.elevation[r.cell] > surface.seaLevel && surface.lakeWeight[r.cell] === 0);
+    assert.equal(grid.neighborCount[r.cell], 6);
+    assert.ok(Number.isFinite(r.m8) && Number.isFinite(r.m10));
+    assert.equal(r.m8Pass, r.m8 >= 3 && r.m8 <= 8);
+    assert.equal(r.m10Pass, r.m10 >= 4);
+  }
+  for (const [metric, key] of [['m8', 'm8Pass'], ['m10', 'm10Pass']]) {
+    const values = sample.rows.map((row) => row[metric]).sort((a, b) => a - b);
+    const q = (p) => {
+      const pos = (values.length - 1) * p, lo = Math.floor(pos), hi = Math.ceil(pos);
+      return values[lo] + (values[hi] - values[lo]) * (pos - lo);
+    };
+    assert.equal(sample[metric].median, q(0.5));
+    assert.equal(sample[metric].p10, q(0.1));
+    assert.equal(sample[metric].p90, q(0.9));
+    assert.equal(sample[metric].passed, sample.rows.filter((r) => r[key]).length);
+  }
+});

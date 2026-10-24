@@ -1,8 +1,8 @@
-/* LocalMap heightfield — базовый рельеф локальной карты (Stage-8.14, W23).
-   Физическая высота берётся из sampleElevation в каждой вершине, поверх неё
-   накладывается общий для всей планеты fBm/detail. Patch7 задаёт маски
-   воды/озёр/рек, но НЕ патч-зависимый якорь высоты. Кольца LOD используют
-   то же поле; врез русла — local-map-rivers.ts, оркестрация — worker.ts. */
+/* LocalMap heightfield — рельеф локальной карты (Stage-8.14, W23b).
+   Длинноволновое sampleElevation выбирается в узлах 65² и интерполируется;
+   коротковолновая деталь fBm/detail считается в каждой вершине по общему
+   направлению планеты. Patch7 задаёт только воду/озёра/реки, а не якорь
+   морского дна. Врез русла — local-map-rivers.ts, оркестрация — worker.ts. */
 
 import {
   isWaterCell,
@@ -31,7 +31,9 @@ export const LAND_FBM_AMPLITUDE_M = 240;
 /** Амплитуда дополнительной детали суши и морского дна, м. */
 export const PROFILE_DETAIL_AMPLITUDE_M = 120;
 
-/** Старая диагностическая решётка 65²; итоговые высоты W23 из неё не читаются. */
+/** 64 интервала/65 узлов для медленного длинноволнового поля планеты. */
+export const ELEVATION_LATTICE_STEPS = 64;
+/** Исторический размер диагностической решётки detail, не источник короткой детали. */
 export const DETAIL_LATTICE_STEPS = 64;
 
 /**
@@ -291,10 +293,10 @@ function hexRingAxial(ring: number): Array<[number, number]> {
 }
 
 /**
- * Heightfield кольца использует тот же сэмпл физического поля, что центральный
- * гекс, на собственном шаге span/res. Ширина span = 2·R_patch соответствует
- * координатам вершин рендерера; прежний span = dHex ≈ 1,15·R_patch при
- * физической геометрии 2·R_patch заставлял LOD означать другую точку.
+ * Кольца используют то же поле и аналитическую локальную деталь. Длинную
+ * волну берём из разрежённой решётки с тем же шагом Nyquist span/res: один
+ * sampleElevation на каждый узел, а не на каждый пиксель 64² соседей.
+ * Физическая ширина span = 2·R_patch совпадает с сеткой рендерера.
  */
 function buildRingCellHeightfield(
   patch: LocalMapPatch,
@@ -308,12 +310,18 @@ function buildRingCellHeightfield(
   const heightfield = new Float32Array(res * res);
   const waterMask = new Uint8Array(res * res);
   const stepM = span / res;
+  // На дальних кольцах ресемплинг 4² уже не нужен; ближнее кольцо 64²
+  // обходится 17² обращениями к полю на ячейку (6 соседей).
+  const steps = Math.min(res, Math.max(4, Math.floor(res / 4)));
+  const lattice = sampleElevationLattice(patch, span / 2, stepM, offsetX, offsetY, steps);
+  const gridRatio = steps / res;
   for (let y = 0; y < res; y++) {
     const wy = offsetY + (y - res / 2) * stepM;
     for (let x = 0; x < res; x++) {
       const wx = offsetX + (x - res / 2) * stepM;
       const dir = localPointToDirection(patch, wx, wy);
-      const h = sampleLocalTerrainHeightM(dir, stepM, patch.frame.radiusM, planetSeed, withDetail);
+      const h = elevationFromLattice(lattice, steps, x * gridRatio, y * gridRatio)
+        + sampleLocalTerrainDetailM(dir, patch.frame.radiusM, planetSeed, withDetail);
       const idx = y * res + x;
       heightfield[idx] = h;
       waterMask[idx] = h < 0 ? 1 : 0;
@@ -510,14 +518,51 @@ export function sampleLandGrainT(
  * умноженных на радиус планеты, а не в локальной касательной плоскости/seed
  * ячейки. Поэтому и суша, и океан имеют одинаковый механизм микрорельефа.
  */
-export function sampleLocalTerrainHeightM(
+/**
+ * Узловое поле на квадрате [offsetX ± radiusM, offsetY ± radiusM].
+ * Шаг Nyquist — шаг ИСХОДНОГО heightfield, а не редкой решётки: иначе на
+ * разных LOD изменится состав октав и появится шов даже у одного `dir`.
+ * В продукте steps=64 даёт ровно 65² выборок sampleElevation на участок.
+ */
+export function sampleElevationLattice(
+  patch: LocalMapPatch,
+  radiusM: number,
+  sourceStepM: number,
+  offsetX = 0,
+  offsetY = 0,
+  steps = ELEVATION_LATTICE_STEPS,
+): Float64Array {
+  const nodes = steps + 1;
+  const grid = new Float64Array(nodes * nodes);
+  const intervalM = (2 * radiusM) / steps;
+  for (let y = 0; y <= steps; y++) {
+    const wy = offsetY - radiusM + y * intervalM;
+    for (let x = 0; x <= steps; x++) {
+      const dir = localPointToDirection(patch, offsetX - radiusM + x * intervalM, wy);
+      grid[y * nodes + x] = sampleElevation(dir, sourceStepM);
+    }
+  }
+  return grid;
+}
+
+/** Билинейная выборка внутреннего интервала узлов (0 ≤ gx, gy < steps). */
+export function elevationFromLattice(lattice: Float64Array, steps: number, gx: number, gy: number): number {
+  const x = Math.floor(gx), y = Math.floor(gy);
+  const tx = gx - x, ty = gy - y;
+  const i = y * (steps + 1) + x;
+  const top = (lattice[i] as number) * (1 - tx) + (lattice[i + 1] as number) * tx;
+  const bottom = (lattice[i + steps + 1] as number) * (1 - tx)
+    + (lattice[i + steps + 2] as number) * tx;
+  return top * (1 - ty) + bottom * ty;
+}
+
+/** Малая деталь — только по мировому `dir`, на КАЖДОЙ вершине без интерполяции. */
+export function sampleLocalTerrainDetailM(
   dir: Vec3,
-  stepM: number,
   planetRadiusM: number,
   seed: number,
   withDetail: boolean,
 ): number {
-  const elevationM = sampleElevation(dir, stepM);
   // Две линейно независимые оси в 3D дают непрерывный общий адрес шума по
   // всей сфере (нет меридианного шва долгот/полюсного скачка). Период первой
   // октавы фиксирован в МЕТРАХ, не в долях R_patch или в шагах LOD.
@@ -528,15 +573,26 @@ export function sampleLocalTerrainHeightM(
   const detail = withDetail
     ? valueNoise2D(ux * 1.8 + 13.7, uy * 1.8 - 7.9, seed ^ 0x2F5A11)
     : 0.5;
-  return elevationM + (macro * 2 - 1) * LAND_FBM_AMPLITUDE_M
+  return (macro * 2 - 1) * LAND_FBM_AMPLITUDE_M
     + (detail * 2 - 1) * (withDetail ? PROFILE_DETAIL_AMPLITUDE_M : 0);
 }
 
+/** Прямая поформенная выборка без решётки — эталон точности для диагностики. */
+export function sampleLocalTerrainHeightM(
+  dir: Vec3,
+  stepM: number,
+  planetRadiusM: number,
+  seed: number,
+  withDetail: boolean,
+): number {
+  return sampleElevation(dir, stepM) + sampleLocalTerrainDetailM(dir, planetRadiusM, seed, withDetail);
+}
+
 /**
- * Поле вершин без вреза рек. Для КАЖДОЙ вершины вычисляется направление
- * exp-карты патча и sampleElevation(dir, 2·R/hfRes). Классификация Patch7
- * влияет только на маски; озеро держит своё каноническое зеркало. Ни берег,
- * ни батиметрия океана НЕ клампятся к константе -0,035 или к высоте центра.
+ * Поле вершин без вреза рек. На 65² узлах sampleElevation выбирается
+ * по направлению exp-карты (полоса 2·R/hfRes), в каждую вершину приходит
+ * билинейная планетная высота + свежая локальная деталь по её `dir`.
+ * Patch7 меняет лишь маски и зеркало озера, не высоту моря/суши.
  */
 export function buildBaseHeightfield(
   patch: LocalMapPatch,
@@ -550,6 +606,8 @@ export function buildBaseHeightfield(
   const heightM = new Float64Array(hfRes * hfRes);
   const landMask = new Uint8Array(hfRes * hfRes);
   const terraformMap = generateTerraformMap();
+  const fieldLattice = sampleElevationLattice(patch, radiusM, stepM);
+  const gridRatio = ELEVATION_LATTICE_STEPS / hfRes;
   let waterPoints = 0;
 
   for (let y = 0; y < hfRes; y++) {
@@ -568,16 +626,15 @@ export function buildBaseHeightfield(
       } else {
         landMask[idx] = 1;
       }
-      // Озёрное зеркало — отдельный гидрологический контракт. Морское дно и
-      // суша используют один и тот же физический сэмпл, включая общий шум.
-      // Даже под озером sampleElevation вызывается на вершине (одинаковая
-      // полоса частот на всех ветвях), но зеркало остаётся на filledElevation.
-      const naturalM = sampleLocalTerrainHeightM(
-        dir, stepM, patch.frame.radiusM, planetSeed, withDetail,
-      );
-      heightM[idx] = cell.lakeWeight > 0
-        ? (waterLevelOf(cell, patch.seaLevel) - patch.seaLevel) * METERS_PER_ELEVATION_UNIT
-        : naturalM;
+      // Озёрное зеркало — отдельный гидрологический контракт; во всех
+      // прочих точках планетное поле и короткая деталь независимы от Patch7.
+      if (cell.lakeWeight > 0) {
+        heightM[idx] = (waterLevelOf(cell, patch.seaLevel) - patch.seaLevel) * METERS_PER_ELEVATION_UNIT;
+      } else {
+        heightM[idx] = elevationFromLattice(fieldLattice, ELEVATION_LATTICE_STEPS,
+          x * gridRatio, y * gridRatio)
+          + sampleLocalTerrainDetailM(dir, patch.frame.radiusM, planetSeed, withDetail);
+      }
     }
   }
   return { heightM, landMask, terraformMap, waterPoints };
