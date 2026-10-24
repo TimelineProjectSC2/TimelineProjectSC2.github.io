@@ -19,7 +19,6 @@
 import {
   baseElevationOf,
   buildBuildingSpawnMask,
-  createPatchFieldSampler,
   isWaterCell,
   localPointToDirection,
   nearestPatchCell,
@@ -29,21 +28,21 @@ import {
 } from './local-map-contract.ts';
 import type { BuildingSpawnRule, LocalMapPatch, PatchCell } from './local-map-contract.ts';
 import type { MeshModuleId } from './local-map-mesh.ts';
-import type { FieldSampler, GeographyProfileInput } from '../../site/shared/planet-geography.ts';
+import type { GeographyProfileInput } from '../../site/shared/planet-geography.ts';
 // Stage-8.10b (A-12b): чистые геометрические хелперы живут в
 // local-map-geometry.ts — главный поток импортирует их оттуда напрямую,
 // а не через этот модуль (который тащит ядро). Реэкспорт нужен для
 // обратной совместимости публичного API воркера и Node-тестов.
-import { SKIRT_RING_COUNT, mapNeighborCellsToSlots, planetCurvatureDropM } from './local-map-geometry.ts';
+import { CENTER_HEX_APOTHEM_RATIO, SKIRT_RING_COUNT, mapNeighborCellsToSlots, planetCurvatureDropM } from './local-map-geometry.ts';
 
 export { SKIRT_RING_COUNT, mapNeighborCellsToSlots, planetCurvatureDropM };
 
 import {
-  HEIGHTFIELD_RES, TERRAFORM_RES, METERS_PER_ELEVATION_UNIT, LAND_FBM_AMPLITUDE_M,
-  PROFILE_DETAIL_AMPLITUDE_M, TERRAFORM_LAND_MIN, TERRAFORM_ALPHA_SPAN, RING_LEVELS,
+  HEIGHTFIELD_RES, TERRAFORM_RES, METERS_PER_ELEVATION_UNIT,
+  PROFILE_DETAIL_AMPLITUDE_M, RING_LEVELS,
   HEX_APOTHEM_RATIO, CENTER_HEX_RADIUS_RATIO, SKIRT_HEX_SPACING_RATIO, hashFloat, hashFloat2,
-  valueNoise2D, ridgedFbm, sampleLandGrainT, clusterHexMetric, buildNeighborRingCells,
-  sampleDetailLattice, smooth01, clampScalar, buildBaseHeightfield,
+  valueNoise2D, clusterHexMetric, buildNeighborRingCells,
+  sampleLocalTerrainHeightM, smooth01, clampScalar, buildBaseHeightfield,
 } from './local-map-heightfield.ts';
 import type { LocalMapRingCell } from './local-map-heightfield.ts';
 import { RIVER_HALF_WIDTH_RATIO, RIVER_DEPTH_RATIO, riverSegments, riverCarveFactor, applyRiverCarve } from './local-map-rivers.ts';
@@ -122,8 +121,8 @@ export interface LocalMapWorkerRequest {
   readonly patchKey?: string;
   /**
    * Stage-8.7: число колец соседних областей вокруг активного гекса, 0..5
-   * (по умолчанию 5). 0 — кольца не генерируются, ответ побайтово совпадает с
-   * текущим поведением main. Кольца требуют профиля (единый 3D-сэмплер).
+   * (по умолчанию 5). 0 отключает кольца, но не возвращает старое поле main.
+   * Кольца требуют профиля (единый 3D-сэмплер).
    */
   readonly neighborRings?: number;
 }
@@ -595,17 +594,14 @@ export function localMapCacheSize(): number {
 
 // ---- Main Entry Point ----
 /**
- * Stage-8.10b (A-12b): генерация стала асинхронной — сэмплер базовых полей
- * поднимает полное Wasm-ядро через динамический импорт внутри
- * createPatchFieldSampler (contract). Данные ответа не изменились
- * (проверка побитовой эквивалентности — golden-тест в
- * tests/local-map-stage8.test.mjs).
+ * Генерация остаётся асинхронной по контракту worker. W23 намеренно меняет
+ * значения heightfield и юбки на общее высотное поле; старые золотые хэши
+ * Stage-8.10b больше не описывают результат и не переписываются здесь.
  */
 export async function generateLocalMap(request: LocalMapWorkerRequest): Promise<LocalMapWorkerResponse> {
   const { patch, seed, placeId, radiusM } = request;
   const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
   const hfRes = HEIGHTFIELD_RES;
-  const cellSize = (2 * radiusM) / hfRes;
 
   // И-3: вход воркера — только валидный канонический срез 7 ячеек глобуса.
   const report = verifyPatchInvariants(patch);
@@ -620,36 +616,33 @@ export async function generateLocalMap(request: LocalMapWorkerRequest): Promise<
   // 0. И-3.4: маска спавна нужна и для смешивания терраформинга, и для scatter.
   const spawnMask = buildBuildingSpawnMask(patch, hfRes, request.spawnRule);
 
-  // 1. Heightfield (h_natural): базовый рельеф (local-map-heightfield.ts: И-3.1/И-3.2,
-  //    A-29 батиметрия океана) и врез русла (local-map-rivers.ts: И-3.3, A-27, A-17b).
-  //    Порядок операций тот же: сначала сырой рельеф в double, затем врез, затем Float32.
+  // 1. Высота по общему физическому направлению, затем врез русла.
+  //    Ни водный Patch7, ни spawnMask, ни терраформинг не смешиваются с высотой.
   const cellSeed = (seed ^ Math.imul((patch.centerCell + 1) >>> 0, 0x9E3779B1)) >>> 0;
-  const sampler = request.profile ? await createPatchFieldSampler(request.profile) : null;
-  const detailLattice = sampler ? sampleDetailLattice(patch, sampler, radiusM) : null;
-  const base = buildBaseHeightfield(patch, radiusM, cellSeed, spawnMask, detailLattice);
-  const heightfield = applyRiverCarve(patch, radiusM, base, spawnMask);
+  // Общий seed всего мира, НЕ идентификатор ячейки: одинаковое направление
+  // планеты даёт одинаковую деталь во всех перекрывающихся участках.
+  const planetSeed = (seed ^ Math.imul((placeId + 1) >>> 0, 0x85EBCA6B)) >>> 0;
+  const base = buildBaseHeightfield(patch, radiusM, planetSeed, spawnMask, !!request.profile);
+  // У старого «устья без streamWeight» есть релаксация с НЕОГРАНИЧЕННОЙ
+  // повторной постановкой вершин в очередь (rivers.ts). На общем метрическом
+  // поле с крутыми склонами она способна расти без конца. При вызове только
+  // для этого устья переключаем режим вреза на обычный (сегмент outlet,
+  // маски и глубина сохраняются), не трогая river-контракт/оригинал Patch7.
+  const mouthCell = patch.river.outlet && patch.cells[patch.river.outlet.slot + 1];
+  const isMouth = !patch.river.flowsThroughCenter && patch.river.inlets.length === 0
+    && !!mouthCell && isWaterCell(mouthCell, patch.seaLevel);
+  const carvePatch: LocalMapPatch = isMouth
+    ? { ...patch, river: { ...patch.river, flowsThroughCenter: true } }
+    : patch;
+  const heightfield = applyRiverCarve(carvePatch, radiusM, base, spawnMask);
   const terraformMap = base.terraformMap;
   const waterPoints = base.waterPoints;
   let buildablePoints = 0;
   for (let i = 0; i < hfRes * hfRes; i++) if (spawnMask[i] === 1) buildablePoints++;
 
-  // 2. Smoothed copy + box blur (площадка терраформинга без «висящего плато»).
-  const blurKernel = Math.max(3, Math.min(10, Math.round(radiusM / cellSize * 0.08)));
-  const smoothed = boxBlurSeparable(heightfield, hfRes, hfRes, blurKernel);
-
-  // 3. Mix: h_final = mix(h_natural, h_smoothed, terraform_alpha) только там, где
-  //    спавн разрешён, — терраформинг базы не засыпает реки и озёра (И-3.2/И-3.3).
-  //    Stage-8.5: альфа считается от подложки суши TERRAFORM_LAND_MIN, поэтому
-  //    минимальный маркер «это суша» не поднимает рельеф там, где терраформинга
-  //    нет (rawTf <= 2 → alpha = 0), а водные тексели (rawTf === 0) остаются
-  //    зеркалом waterLevelOf без размывания берега.
-  for (let i = 0; i < hfRes * hfRes; i++) {
-    if (spawnMask[i] !== 1) continue;
-    const rawTf = terraformMap[i] as number;
-    const alpha = rawTf <= TERRAFORM_LAND_MIN ? 0 : (rawTf - TERRAFORM_LAND_MIN) / TERRAFORM_ALPHA_SPAN;
-    if (alpha <= 0) continue;
-    heightfield[i] = (heightfield[i] as number) * (1 - alpha) + (smoothed[i] as number) * alpha;
-  }
+  // Терраформинг по гауссиане ЦЕНТРА ПАТЧА больше не смешивается с высотой:
+  // на одной физической точке у двух патчей альфа была разной (шов). Карта
+  // terraformMap остаётся для маркеров воды и зонирования/материала.
 
   // 4. Zone map: вода/озёра/русла остаются без зонирования (И-3.2/И-3.4).
   //    radiusM передаётся, чтобы зонирование учитывало и локальный размах
@@ -660,7 +653,7 @@ export async function generateLocalMap(request: LocalMapWorkerRequest): Promise<
   const instances = scatterInstances(zoneMap, heightfield, radiusM, cellSeed, placeId, spawnMask);
   const instanceBuffers = packInstancesByModule(instances);
 
-  // Финальные границы высот после смешивания терраформинга.
+  // Финальные границы высот после вреза рек.
   let finalMin = Infinity;
   let finalMax = -Infinity;
   for (let i = 0; i < heightfield.length; i++) {
@@ -670,15 +663,15 @@ export async function generateLocalMap(request: LocalMapWorkerRequest): Promise<
   }
 
   // Stage-8.7: кольца соседних областей вокруг активного гекса. Кольца
-  // требуют единый 3D-сэмплер (профиль) — без профиля ringCells отсутствуют.
+  // требуют профиль — без профиля ringCells отсутствуют.
   const neighborRings = clampScalar(Math.floor(request.neighborRings ?? RING_LEVELS), 0, RING_LEVELS);
   let ringCells: LocalMapRingCell[] | undefined;
   let ringCellCount = 0;
   let ringGenMs = 0;
-  if (neighborRings > 0 && sampler) {
+  if (neighborRings > 0 && request.profile) {
     const ringStartedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
     ringCells = buildNeighborRingCells(
-      patch, sampler, neighborRings, patch.seaLevel, request.radiusM,
+      patch, neighborRings, radiusM, planetSeed, true,
     );
     ringCellCount = ringCells.length;
     ringGenMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - ringStartedAt;
@@ -720,11 +713,8 @@ export async function generateLocalMap(request: LocalMapWorkerRequest): Promise<
 // `clusterHexMetric(x, y)` (бесшовный шестиугольный срез), а весь горизонт
 // получает честный радиус кривизны планеты.
 //
-// Stage-8.2.1 (хотфикс): юбка держит зеркало континентальных озёр выше
-// seaLevel (waterLevelOf вместо Math.min(0, ...)), калибрует канал `elevation`
-// макро-решётки относительно канонического центра патча и гасит сухопутный
-// шум у уреза воды — вместо 253-метровой шестигранной «столовой горы»
-// посреди круглого кратера/рва.
+// W23: юбка сэмплирует то же мировое поле, что и центральный heightfield;
+// только маска воды и зеркало озера определяются гидрологией Patch7.
 // ---------------------------------------------------------------------------
 
 /** Угловых сегментов контура горизонта: 6 секторов × 24 шагов (145 узлов с замыканием). */
@@ -732,13 +722,12 @@ export const SKIRT_ANGULAR_SEGMENTS = 144;
 /** Радиальных шагов единой полярной сетки горизонта: 36 плотных + 48 до сферы (85 рядов). */
 export const SKIRT_RADIAL_RINGS = 84;
 /**
- * Радиальных шагов плотного воротника. 36 шагов удерживают ошибку линейной
- * интерполяции полярного меша на шестиугольном срезе ниже 1 м даже на
- * высокочастотном рельефе A-17; общее число рядов и GPU-бюджет не меняются.
+ * Радиальных шагов плотного воротника: 36 из 84. Новое поле W23 может
+ * дать остаток интерполяции на срезе > 1 м — он отражён в стенде.
  */
 export const SKIRT_COLLAR_RINGS = 36;
-/** Доля R_patch: внутренний радиус непрерывной юбки (воротник перекрывает центральный гекс). */
-export const SKIRT_INNER_RADIUS_RATIO = 0.72;
+/** Юбка начинается ВНУТРИ новой апофемы (0,575 R), иначе вдоль граней зияет щель. */
+export const SKIRT_INNER_RADIUS_RATIO = CENTER_HEX_APOTHEM_RATIO * 0.9;
 /** Доля R_patch: внешний радиус плотного воротника вокруг выделенного гекса. */
 export const SKIRT_COLLAR_END_RADIUS_RATIO = 1.15;
 /** Число шагов d_hex от центра юбки до сферического горизонта (R_outer = 10.0 · d_hex). */
@@ -753,15 +742,12 @@ export const SKIRT_COLLAR_BLEND_END_RATIO = 1.35;
 export const SKIRT_HEIGHTFIELD_GUARD_RATIO = 0.98;
 /**
  * Stage-8.5.1: «разумный кап» размаха положительных высот макро-решётки, м.
- * На морском патче Patch7 целиком вода (перепад 0), поэтому берег, выходящий
- * из океана во 2–4 кольце юбки, получает амплитуду прибрежных гряд именно из
- * калиброванного канала `elevation`, но не выше этого капа.
+ * Исторический экспорт амплитуды по решётке для автономных диагностик
+ * Stage-8.5.1; в W23 физическая высота юбки от него не зависит.
  */
 export const SKIRT_LATTICE_RELIEF_CAP_M = 240;
 /** Число ячеек канонической сетки Голдберга v = 128: 10v² + 2. */
 const GOLDBERG_V128_CELLS = 10 * 128 * 128 + 2;
-/** Узлов макро-решётки 3D-сэмплера на сторону (33×33 = 1 089 опросов). */
-const SKIRT_LATTICE_STEPS = 32;
 
 /**
  * Геометрия непрерывной сферической юбки горизонта вокруг выделенного
@@ -777,7 +763,7 @@ export interface HorizonSkirtData {
   /** 255 — водный стрежень русла; 0 — не русло. */
   readonly riverMask: Uint8Array;
   readonly indices: Uint32Array;
-  /** R_inner = 0.72 · R_patch — внутреннее кольцо непрерывной юбки. */
+  /** R_inner = 0,9 · апофема = 0,5175 · R_patch — юбка перекрывает грани. */
   readonly innerRadiusM: number;
   /** R_outer = 10.0 · d_hex = 11.5 · R_patch — сферический горизонт юбки. */
   readonly outerRadiusM: number;
@@ -829,64 +815,15 @@ interface SkirtElevationLattice {
   readonly detail: Float32Array;
 }
 
-/**
- * Макро-решётка базовой высоты и детализации на квадрате [-R_skirt, +R_skirt].
- * Stage-8.3: узлы решётки опрашиваются в планетарных координатах
- * `(x · planetCoordScale, y · planetCoordScale)`, где `planetCoordScale` —
- * отношение физического шага гексов планеты (`hexSpacingMeters`, ~60 км для
- * Земли v=128) к визуальному шагу юбки (`1.15 · radiusM`). Поэтому решётка
- * 33×33 охватывает реальные 10 колец канонических ячеек вокруг активного
- * гекса при любом `radiusM`, а не крошечный пятачок в центре одной ячейки.
- */
-function sampleSkirtElevationLattice(
-  patch: LocalMapPatch,
-  sampler: FieldSampler,
-  extentM: number,
-  planetCoordScale = 1,
-): SkirtElevationLattice {
-  const nodes = SKIRT_LATTICE_STEPS + 1;
-  const elevation = new Float32Array(nodes * nodes);
-  const detail = new Float32Array(nodes * nodes);
-  const scratch = new Float32Array(8);
-  for (let j = 0; j < nodes; j++) {
-    const y = (j / SKIRT_LATTICE_STEPS - 0.5) * 2 * extentM;
-    for (let i = 0; i < nodes; i++) {
-      const x = (i / SKIRT_LATTICE_STEPS - 0.5) * 2 * extentM;
-      const dir = localPointToDirection(patch, x * planetCoordScale, y * planetCoordScale);
-      const fields = sampler.sampleFields(dir[0], dir[1], dir[2], scratch);
-      const index = j * nodes + i;
-      const detailValue = fields[5] as number;
-      elevation[index] = fields[0] as number;
-      detail[index] = detailValue < -1 ? -1 : detailValue > 1 ? 1 : detailValue;
-    }
-  }
-  return { elevation, detail };
-}
-
-function sampleSkirtLatticeAt(lattice: Float32Array, extentM: number, x: number, y: number): number {
-  const nodes = SKIRT_LATTICE_STEPS + 1;
-  const gx = clampScalar((x / (2 * extentM) + 0.5) * SKIRT_LATTICE_STEPS, 0, SKIRT_LATTICE_STEPS - 1e-9);
-  const gy = clampScalar((y / (2 * extentM) + 0.5) * SKIRT_LATTICE_STEPS, 0, SKIRT_LATTICE_STEPS - 1e-9);
-  const ix = Math.floor(gx);
-  const iy = Math.floor(gy);
-  const ax = gx - ix;
-  const ay = gy - iy;
-  const i00 = iy * nodes + ix;
-  const top = (lattice[i00] as number) * (1 - ax) + (lattice[i00 + 1] as number) * ax;
-  const bottom = (lattice[i00 + nodes] as number) * (1 - ax) + (lattice[i00 + nodes + 1] as number) * ax;
-  return top * (1 - ay) + bottom * ay;
-}
-
-/** Плавный радиально-угловой якорь Patch7 без границ Вороного и скачков воды. */
-function smoothPatchBaseElevation(
+/** Только водная СЕМАНТИКА Patch7 для цвета и масок, не высота грунта. */
+function skirtSemanticWater(
   patch: LocalMapPatch,
   neighborSlots: readonly PatchCell[],
-  centerCanonElev: number,
   radiusPatchM: number,
   x: number,
   y: number,
   r: number,
-): { elevation: number; water: number; waterLevel: number } {
+): number {
   const center = patch.cells[0] as PatchCell;
   const collarEndM = SKIRT_COLLAR_END_RADIUS_RATIO * radiusPatchM;
   const centerApothemM = CENTER_HEX_RADIUS_RATIO * HEX_APOTHEM_RATIO * radiusPatchM;
@@ -897,43 +834,20 @@ function smoothPatchBaseElevation(
   const c1 = neighborSlots[(k0 + 1) % SKIRT_RING_COUNT] as PatchCell;
   const angularBlend = smooth01(slot - Math.floor(slot));
   const mix = (a: number, b: number, t: number): number => a + (b - a) * t;
-  const isOcean = (cell: PatchCell): boolean =>
-    cell.elevation < patch.seaLevel && cell.lakeWeight === 0;
-  const isLake = (cell: PatchCell): boolean => cell.lakeWeight > 0;
+  const isOcean = (cell: PatchCell): boolean => cell.elevation < patch.seaLevel && cell.lakeWeight === 0;
   const centerIsOcean = isOcean(center);
+  // Для океана водная маска проходит воротник целиком до выхода на берег;
+  // континентальное озеро держит зеркало на большей дальности.
   const oceanBlendStartM = collarEndM + 0.12 * radiusPatchM;
-  // A-17 / A-29 / A-31: на суше видимый центр соседа лежит на collarEndM,
-  // а на океанском центре каноническая батиметрия и водность проходят через
-  // воротник и 6 шагов профиля (collarEndM + 0.12·R) единым расписанием с
-  // oceanProfileBlend и плавно переходят к соседям вдоль юбки — прибрежный
-  // сосед не поднимает дно и не разбавляет water до окончания полосы воротника.
   const neighborBlend = centerIsOcean
     ? smooth01((r - oceanBlendStartM) / (0.8 * radiusPatchM))
     : smooth01((r - centerApothemM) / Math.max(1, collarEndM - centerApothemM));
-  // Океан несёт честную отрицательную отметку дна, а не зеркало seaLevel.
-  // Минимум -0.035 единицы (~ -31.5 м) предотвращает ложный зелёный берег
-  // из-за мелких численных колебаний прямо на уровне моря.
-  const signedCanon = (cell: PatchCell): number => {
-    if (isLake(cell)) return waterLevelOf(cell, patch.seaLevel);
-    if (isOcean(cell)) return Math.min(cell.elevation, patch.seaLevel - 0.035);
-    return baseElevationOf(cell);
-  };
-  const centerIsLake = isLake(center) && centerCanonElev > patch.seaLevel;
-  // Дальняя задержка водности требуется лишь континентальному озеру: она
-  // удерживает его зеркало за воротником. Океан и суша синхронно переходят к
-  // соседу по единому neighborBlend, не вырезая круглый бассейн вокруг центра.
+  const centerIsLake = center.lakeWeight > 0 && waterLevelOf(center, patch.seaLevel) > patch.seaLevel;
   const waterBlend = centerIsLake
     ? smooth01((r - 1.8 * radiusPatchM) / (2.4 * radiusPatchM))
     : neighborBlend;
-  const waterOf = (cell: PatchCell): number => Number(isOcean(cell) || isLake(cell));
-  const waterSurfaceOf = (cell: PatchCell): number =>
-    isLake(cell) ? waterLevelOf(cell, patch.seaLevel) : patch.seaLevel;
-  return {
-    elevation: mix(signedCanon(center), mix(signedCanon(c0), signedCanon(c1), angularBlend), neighborBlend),
-    water: mix(waterOf(center), mix(waterOf(c0), waterOf(c1), angularBlend), waterBlend),
-    waterLevel: mix(waterSurfaceOf(center),
-      mix(waterSurfaceOf(c0), waterSurfaceOf(c1), angularBlend), waterBlend),
-  };
+  const waterOf = (cell: PatchCell): number => Number(isOcean(cell) || cell.lakeWeight > 0);
+  return mix(waterOf(center), mix(waterOf(c0), waterOf(c1), angularBlend), waterBlend);
 }
 
 /** Мягкое продолжение русла в соседних ячейках юбки горизонта. */
@@ -973,7 +887,7 @@ function skirtRiverCarveFactor(
 }
 
 /**
- * Stage-8.5: амплитуда горных гребней юбки, м — РЕАЛЬНЫЙ перепад высот Patch7
+ * Диагностика прежней амплитуды горных гребней юбки, м — перепад высот Patch7
  * (канонические высоты центра и 6 угловых слотов `mapNeighborCellsToSlots`)
  * плюс размах канала `detail` макро-решётки. Равнинный патч даёт малую
  * амплитуду (открытая равнина вокруг гекса), контрастный горный — большую;
@@ -1018,8 +932,7 @@ export function skirtLocalReliefAmplitudeM(
   const detailReliefM = Number.isFinite(minDetail) && Number.isFinite(maxDetail)
     ? (maxDetail - minDetail) * PROFILE_DETAIL_AMPLITUDE_M
     : 0;
-  // Размах положительных высот макро-решётки над seaLevel, м (калибровка та же,
-  // что у сэмпла высоты в skirtPlanetaryHeight и центре патча).
+  // Размах положительных высот исторической макро-решётки для диагностики.
   let maxLatticeAboveSeaM = 0;
   for (let i = 0; i < elevLattice.elevation.length; i++) {
     const aboveSeaM = ((elevLattice.elevation[i] as number) + elevCalibration - patch.seaLevel)
@@ -1031,196 +944,6 @@ export function skirtLocalReliefAmplitudeM(
 }
 
 /**
- * Планетарная высота точки юбки относительно seaLevel, м. Частота, seed и
- * положительный базовый уровень fBm/detail совпадают с generateLocalMap,
- * поэтому на стыке больше нет ступеньки +60 м. На первых 3–4 кольцах
- * гладкий якорь Patch7 плавно уступает непрерывной макро-решётке, а канал
- * `elevation` решётки калибруется сдвигом `elevCalibration` относительно
- * канонического центра патча (озеро выше seaLevel держит filledElevation).
- */
-function skirtPlanetaryHeight(
-  patch: LocalMapPatch,
-  radiusPatchM: number,
-  x: number,
-  y: number,
-  r: number,
-  cellSeed: number,
-  planetSeed: number,
-  noiseScale: number,
-  elevLattice: SkirtElevationLattice | null,
-  elevCalibration: number,
-  outerRadiusM: number,
-  planetCoordScale: number,
-  neighborSlots: readonly PatchCell[],
-  centerCanonElev: number,
-  localReliefAmpM: number,
-): number {
-  const collarEndM = SKIRT_COLLAR_END_RADIUS_RATIO * radiusPatchM;
-  const center = patch.cells[0] as PatchCell;
-
-  // Stage-8.6: cellSeed нужен лишь в воротнике для бесшовной стыковки с
-  // активным гексом. За воротником fBm/ridged и тектоническая маска получают
-  // общий для всей планеты seed, поэтому горизонт не меняет характер при
-  // переходе на соседнюю ячейку.
-  const collarNoiseBlend = smooth01((r - SKIRT_INNER_RADIUS_RATIO * radiusPatchM)
-    / Math.max(1, collarEndM - SKIRT_INNER_RADIUS_RATIO * radiusPatchM));
-  const blendNoise = (fromCell: number, fromPlanet: number): number =>
-    fromCell * (1 - collarNoiseBlend) + fromPlanet * collarNoiseBlend;
-  // A-17: одна и та же видимая точка воротника, макро-решётки и кольцевого
-  // меша должна означать одну планетарную координату. На грани активного гекса
-  // остаёмся в локальном масштабе, а к видимому центру соседа (collarEndM)
-  // достигаем полного planetCoordScale. Прежний разгон ещё на 3.2 R_patch
-  // сдвигал берег относительно кольцевых ячеек на несколько километров.
-  const centerApothemM = CENTER_HEX_RADIUS_RATIO * HEX_APOTHEM_RATIO * radiusPatchM;
-  const centerIsOcean = center.elevation < patch.seaLevel && center.lakeWeight === 0;
-  const bathymetryBlendStartM = collarEndM + 0.12 * radiusPatchM;
-  const oceanTransitionBlend = smooth01((r - bathymetryBlendStartM) / (0.8 * radiusPatchM));
-  const coordScale = 1 + (planetCoordScale - 1) * (centerIsOcean
-    ? oceanTransitionBlend
-    : smooth01((r - centerApothemM) / Math.max(1, collarEndM - centerApothemM)));
-  const base = smoothPatchBaseElevation(patch, neighborSlots, centerCanonElev, radiusPatchM, x, y, r);
-  const baseElevM = (base.elevation - patch.seaLevel) * METERS_PER_ELEVATION_UNIT;
-  const water = clampScalar(base.water, 0, 1);
-  // A-31: прибрежный вес шума выходит из нуля у уреза воды (-2..+16 м), чтобы
-  // низменные пляжи (+4 м) не вздувались до 80-метровых холмов над мелким заливом.
-  const landWeight = clampScalar(1 - water, 0, 1) * smooth01((baseElevM + 2) / 18);
-
-  // И-3.2: континентальное озеро сохраняет положительное зеркало. У океана
-  // waterMirrorM == 0, а ниже используется реальная отрицательная отметка дна.
-  const waterMirrorM = (base.waterLevel - patch.seaLevel) * METERS_PER_ELEVATION_UNIT;
-  const latticeX = (x * coordScale) / planetCoordScale;
-  const latticeY = (y * coordScale) / planetCoordScale;
-  const calibratedM = elevLattice
-    ? (sampleSkirtLatticeAt(elevLattice.elevation, outerRadiusM, latticeX, latticeY)
-      + elevCalibration - patch.seaLevel) * METERS_PER_ELEVATION_UNIT
-    : baseElevM;
-
-  // A-31: единый бюджет и зерно sampleLandGrainT без detailFade — патч и
-  // воротник имеют строго одинаковую частоту и амплитуду, а за воротником шаг
-  // шума плавно согласуется с угловым разрешением полярных колец (без провала
-  // амплитуды и без высокочастотного углового алиасинга на дальних кольцах).
-  const landBudgetM = LAND_FBM_AMPLITUDE_M + (elevLattice ? PROFILE_DETAIL_AMPLITUDE_M : 0);
-  const detailSigned = elevLattice
-    ? sampleSkirtLatticeAt(elevLattice.detail, outerRadiusM, latticeX, latticeY)
-    : null;
-  const polarSpanRatio = Math.max(0, r / Math.max(1, collarEndM) - 1);
-  const grainScale = noiseScale / (1 + 0.55 * polarSpanRatio);
-  const gx = x * grainScale;
-  const gy = y * grainScale;
-  const ux = x * noiseScale;
-  const uy = y * noiseScale;
-  let grainT: number;
-  if (collarNoiseBlend <= 0) {
-    grainT = sampleLandGrainT(gx, gy, cellSeed, detailSigned);
-  } else if (collarNoiseBlend >= 1) {
-    grainT = sampleLandGrainT(gx, gy, planetSeed, detailSigned);
-  } else {
-    grainT = blendNoise(
-      sampleLandGrainT(gx, gy, cellSeed, detailSigned),
-      sampleLandGrainT(gx, gy, planetSeed, detailSigned),
-    );
-  }
-  const grainM = grainT * landBudgetM;
-
-  const centerOceanDepthM = (
-    Math.min(center.elevation, patch.seaLevel - 0.035) - patch.seaLevel
-  ) * METERS_PER_ELEVATION_UNIT;
-  const centerElevM = (centerCanonElev - patch.seaLevel) * METERS_PER_ELEVATION_UNIT;
-  const centerIsLake = center.lakeWeight > 0 && centerCanonElev > patch.seaLevel;
-  const centerScaleM = centerIsOcean
-    ? Math.abs(centerOceanDepthM)
-    : centerIsLake
-      ? Math.max(31.5, Math.abs(centerElevM))
-      : Math.max(31.5, Math.abs(centerElevM) + 0.52 * landBudgetM);
-
-  let mountainM = 0;
-  if (landWeight > 0.01 && r > collarEndM) {
-    const mountainEnvelope = smooth01((r - collarEndM) / (2.8 * radiusPatchM))
-      * (1 - 0.30 * smooth01((r - 6.0 * radiusPatchM) / (outerRadiusM - 6.0 * radiusPatchM)));
-    const macroElevM = calibratedM;
-    const upliftT = smooth01((macroElevM - 40) / 260);
-    const riseT = smooth01((macroElevM - centerElevM + 110) / 320);
-    const reliefMask = upliftT * (0.35 + 0.65 * riseT);
-    const ridgeVal = blendNoise(
-      ridgedFbm(ux * 0.42, uy * 0.42, cellSeed ^ 0x5A17C3, 5),
-      ridgedFbm(ux * 0.42, uy * 0.42, planetSeed ^ 0x5A17C3, 5),
-    );
-    const macroBasin = blendNoise(
-      valueNoise2D(ux * 0.05 + 3.7, uy * 0.05 - 5.1, cellSeed ^ 0x3391B7),
-      valueNoise2D(ux * 0.05 + 3.7, uy * 0.05 - 5.1, planetSeed ^ 0x3391B7),
-    );
-    const basinMask = smooth01((macroBasin - 0.52) / 0.32);
-    const peakAmpM = Math.min(320, Math.max(60, localReliefAmpM));
-    mountainM = peakAmpM * mountainEnvelope * reliefMask * basinMask * Math.pow(ridgeVal, 1.35);
-  }
-
-  // Положительный сухопутный шум никогда не поднимает океанское дно: при
-  // water -> 1 или baseElevM <= -2 его вес плавно уходит к нулю.
-  const landNoiseM = (grainM + mountainM) * landWeight;
-  const defaultWaterHeightM = waterMirrorM > 0 ? waterMirrorM : Math.min(baseElevM, 0);
-  // A-29 / A-31: тот же канонический профиль проходит через воротник и ещё 0.12 R
-  // снаружи, после чего плавно переходит к соседним ячейкам Patch7.
-  const nearWaterHeightM = centerIsOcean
-    ? centerOceanDepthM + (defaultWaterHeightM - centerOceanDepthM) * oceanTransitionBlend
-    : defaultWaterHeightM;
-  const landHeight = baseElevM + landNoiseM;
-  const nearHeight = nearWaterHeightM * water + landHeight * (1 - water);
-
-  let height = nearHeight;
-  if (r > radiusPatchM && elevLattice) {
-    // Для отрицательного океанского сэмпла не используем Math.max(0, ...):
-    // дно опускается ниже seaLevel за контрольной полосой воротника и остаётся
-    // видимым как настоящая батиметрия до горизонта.
-    const waterHeight = waterMirrorM > 0
-      ? waterMirrorM
-      : (calibratedM < 0
-        ? nearWaterHeightM + (calibratedM - nearWaterHeightM) * smooth01((r - bathymetryBlendStartM) / (0.8 * radiusPatchM))
-        : Math.min(baseElevM, 0));
-    const latticeLandHeight = calibratedM + landNoiseM;
-    const latticeHeight = waterHeight * water + latticeLandHeight * (1 - water);
-    // A-29: первые 0.12 R после воротника сохраняют тот же канонический
-    // профиль глубины, что край центрального патча.
-    const latticeBlend = smooth01(
-      (r - bathymetryBlendStartM) / (3.28 * radiusPatchM),
-    );
-    height = nearHeight * (1 - latticeBlend) + latticeHeight * latticeBlend;
-  }
-
-  // Русло продолжается за активный гекс во 2–3 кольца соседей. На зеркале
-  // континентального озера его не вырезаем: инвариант Stage-8.2.1 важнее.
-  if (waterMirrorM <= 0 && water < 0.5) {
-    const riverHalfWidthM = Math.max((4 * radiusPatchM) / HEIGHTFIELD_RES,
-      radiusPatchM * RIVER_HALF_WIDTH_RATIO);
-    const riverDepthM = Math.max(10, radiusPatchM * RIVER_DEPTH_RATIO * 1.8);
-    const channel = skirtRiverCarveFactor(
-      patch, neighborSlots, x, y, r, radiusPatchM, riverHalfWidthM,
-    );
-    const valley = skirtRiverCarveFactor(
-      patch, neighborSlots, x, y, r, radiusPatchM, riverHalfWidthM * 2.4,
-    );
-    height -= riverDepthM * (0.45 * valley + 0.55 * channel);
-  }
-
-  // A-31: при активном профиле (elevLattice) за контрольной полосой воротника
-  // вертикальный размах дальнего горизонта C^1-гладко согласуется с собственным
-  // масштабом участка centerScaleM: внутри ±0.90·centerScaleM профиль проходит
-  // тождественно (z = 0 и береговая линия инвариантны), а выбросы сжатой по
-  // горизонтали макро-решётки мягко насыщаются к ±1.18·centerScaleM.
-  if (elevLattice && !centerIsLake && r > bathymetryBlendStartM) {
-    const kneeM = 1.02 * centerScaleM;
-    const maxM = 1.38 * centerScaleM;
-    const absH = Math.abs(height);
-    const boundedAbs = absH <= kneeM
-      ? absH
-      : kneeM + (maxM - kneeM) * Math.tanh((absH - kneeM) / Math.max(1, maxM - kneeM));
-    const boundedHeight = height < 0 ? -boundedAbs : boundedAbs;
-    const envBlend = smooth01((r - bathymetryBlendStartM) / (0.8 * radiusPatchM));
-    height = height + (boundedHeight - height) * envBlend;
-  }
-  return height;
-}
-
-/**
  * Генерация непрерывной сферической юбки горизонта вокруг выделенного
  * центрального гекса активной ячейки (Stage-8.2, вместо кластера из 7 плит):
  *
@@ -1229,7 +952,7 @@ function skirtPlanetaryHeight(
  *   непрерывен по всем направлениям, без 6 отдельных плит-лепестков и без
  *   физических провалов фасок `bevelDropM`.
  * - Первые `SKIRT_COLLAR_RINGS = 36` радиальных шагов — плотный воротник от
- *   `R_inner = 0.72 · R_patch` до `1.15 · R_patch`; остальные 48 шагов — от
+ *   `R_inner = 0.9 · A` до `1.15 · R_patch`; остальные 48 шагов — от
  *   `1.15 · R_patch` до `R_outer = 10.0 · d_hex = 11.5 · R_patch` по степени
  *   `Math.pow(t, 1.35)` (сгущение линий у выделенного гекса).
  * - Гексагональная сшивка высот воротника: шейдер обрезает центральный меш
@@ -1237,8 +960,8 @@ function skirtPlanetaryHeight(
  *   `A = centerApothemM = CENTER_HEX_RADIUS_RATIO · HEX_APOTHEM_RATIO · R_patch`.
  *   При `hexDist <= 1.005 · A` высота равна ТОЧНОЙ билинейной выборке
  *   `innerHeightfield` (`blend = 0`) — на всём шестиугольном срезе нет ни
- *   ступеньки, ни щели. На полосе `1.005 · A < hexDist <= 1.20 · A` высота
- *   плавно смешивается через `smooth01` с `skirtPlanetaryHeight`.
+ *   ступеньки, ни щели. На полосе `1.005 · A < hexDist <= 1.35 · A` высота
+ *   плавно смешивается через `smooth01` с тем же мировым полем.
  * - Кривизна — `R_planet = 3.6 · R_outer` (проседание касательной плоскости
  *   применяет вершинный шейдер); нормали — гладкие конечные разности полярной
  *   сетки с угловым замыканием `i % SKIRT_ANGULAR_SEGMENTS` и ориентацией `nz > 0`.
@@ -1251,7 +974,7 @@ export async function generateHorizonSkirt(
   const neighborSlots = mapNeighborCellsToSlots(patch);
   const radiusPatchM = request.radiusM;
   // Апофема выделенного центрального гекса: ровно тот контур, по которому шейдер
-  // обрезает центральный меш 257 × 257 (hexApothem = 0.8054 · R_patch).
+  // обрезает центральный меш 257 × 257 (hexApothem = 0,575 · R_patch).
   const centerApothemM = CENTER_HEX_RADIUS_RATIO * HEX_APOTHEM_RATIO * radiusPatchM;
   const innerRadiusM = SKIRT_INNER_RADIUS_RATIO * radiusPatchM;
   const hexSpacingM = SKIRT_HEX_SPACING_RATIO * radiusPatchM;
@@ -1269,48 +992,10 @@ export async function generateHorizonSkirt(
     SKIRT_PLANET_RADIUS_SPACING_RATIO * outerRadiusM,
   );
 
-  // Stage-8.3: физический шаг центров соседних гексов на глобусе (~60 км для
-  // Земли v=128) против визуального шага юбки (690 м при radiusPatchM = 600 м).
-  // Коэффициент растяжения касательных координат за пределами воротника:
-  // макро-решётка и выбор соседних ячеек видят настоящую планету, а не
-  // увеличенный в десятки раз центр одной-единственной ячейки.
-  const planetHexSpacingM = hexSpacingMeters(patch.frame.radiusM);
-  const planetCoordScale = Math.max(1, planetHexSpacingM / Math.max(hexSpacingM, 1));
-
-  const sampler = request.profile ? await createPatchFieldSampler(request.profile) : null;
-  const elevLattice = sampler
-    ? sampleSkirtElevationLattice(patch, sampler, outerRadiusM, planetCoordScale)
-    : null;
-  const cellSeed = (request.seed ^ Math.imul((patch.centerCell + 1) >>> 0, 0x9E3779B1)) >>> 0;
-  // Stage-8.6: шум горизонта принадлежит планете/placeId, а не случайному
-  // идентификатору активной ячейки; cellSeed смешивается только в воротнике.
+  // Параметры общего планетарного поля зависят от планеты/placeId, а не от
+  // активной ячейки. Никакая макро-решётка с калибровкой по её центру не нужна.
   const planetSeed = (request.seed
     ^ Math.imul((request.placeId + 1) >>> 0, 0x85EBCA6B)) >>> 0;
-  const noiseScale = (3.5 + Math.log2(Math.max(1, radiusPatchM / 600)) * 0.65) / Math.max(radiusPatchM, 1);
-
-  // И-3.2: калибровка канала `elevation` макро-решётки относительно центра
-  // патча. Сэмплер c100-soft-v2 отдаёт «сырую» высоту, а канонический центр
-  // держит filledElevation (вода) или baseElevationOf (суша); без сдвига
-  // юбка уезжала бы от зеркала континентального озера на сотни метров.
-  const centerCell = patch.cells[0] as PatchCell;
-  const centerCanonElev = isWaterCell(centerCell, patch.seaLevel)
-    ? waterLevelOf(centerCell, patch.seaLevel)
-    : baseElevationOf(centerCell);
-  const rawCenterElev = elevLattice
-    ? sampleSkirtLatticeAt(elevLattice.elevation, outerRadiusM, 0, 0)
-    : centerCanonElev;
-  // Калибровка нужна только озеру над seaLevel. Применять её к океану
-  // запрещено: она поднимала сырое морское дно на сотни метров и вместе с
-  // круглой водной маской оставляла в центре ложный бассейн.
-  const elevCalibration = (centerCell.lakeWeight > 0 && centerCanonElev > patch.seaLevel)
-    ? centerCanonElev - rawCenterElev
-    : 0;
-
-  // Stage-8.5: амплитуда горных гребней — от реального перепада высот патча и
-  // размаха канала `detail`, а не от визуального радиуса участка.
-  const localReliefAmpM = skirtLocalReliefAmplitudeM(
-    patch, neighborSlots, centerCanonElev, elevLattice, elevCalibration,
-  );
 
   const innerRes = HEIGHTFIELD_RES;
   const hasCollar = !!innerHeightfield && innerHeightfield.length >= innerRes * innerRes;
@@ -1343,6 +1028,30 @@ export async function generateHorizonSkirt(
   const blendEndM = SKIRT_COLLAR_BLEND_END_RATIO * centerApothemM;
   const blendSpanM = blendEndM - blendStartM;
   const guardM = SKIRT_HEIGHTFIELD_GUARD_RATIO * radiusPatchM;
+  const fieldStepM = (2 * radiusPatchM) / HEIGHTFIELD_RES;
+  // В воротнике и на всех кольцах юбка получает ТО ЖЕ непрерывное поле,
+  // что центральная сетка и LOD, даже при автономном вызове без профиля.
+  const fieldHeightAt = (x: number, y: number, r: number): number => {
+    const dir = localPointToDirection(patch, x, y);
+    const cell = nearestPatchCell(patch, dir);
+    if (cell.lakeWeight > 0) {
+      return (waterLevelOf(cell, patch.seaLevel) - patch.seaLevel) * METERS_PER_ELEVATION_UNIT;
+    }
+    let h = sampleLocalTerrainHeightM(
+      dir, fieldStepM, patch.frame.radiusM, planetSeed, !!request.profile,
+    );
+    if (!isWaterCell(cell, patch.seaLevel)) {
+      const riverDepthM = Math.max(10, radiusPatchM * RIVER_DEPTH_RATIO * 1.8);
+      const channel = skirtRiverCarveFactor(
+        patch, neighborSlots, x, y, r, radiusPatchM, riverHalfWidthM,
+      );
+      const valley = skirtRiverCarveFactor(
+        patch, neighborSlots, x, y, r, radiusPatchM, riverHalfWidthM * 2.4,
+      );
+      h -= riverDepthM * (0.45 * valley + 0.55 * channel);
+    }
+    return h;
+  };
 
   for (let j = 0; j < radialCount; j++) {
     const r = ringRadius[j] as number;
@@ -1364,17 +1073,11 @@ export async function generateHorizonSkirt(
           z = innerZ;
         } else {
           const blend = smooth01((hexDist - blendStartM) / blendSpanM);
-          const planetaryZ = skirtPlanetaryHeight(
-            patch, radiusPatchM, x, y, r, cellSeed, planetSeed, noiseScale, elevLattice, elevCalibration, outerRadiusM,
-            planetCoordScale, neighborSlots, centerCanonElev, localReliefAmpM,
-          );
+          const planetaryZ = fieldHeightAt(x, y, r);
           z = innerZ + (planetaryZ - innerZ) * blend;
         }
       } else {
-        z = skirtPlanetaryHeight(
-          patch, radiusPatchM, x, y, r, cellSeed, planetSeed, noiseScale, elevLattice, elevCalibration, outerRadiusM,
-          planetCoordScale, neighborSlots, centerCanonElev, localReliefAmpM,
-        );
+        z = fieldHeightAt(x, y, r);
       }
 
       const vertex = j * angularCount + i;
@@ -1386,15 +1089,13 @@ export async function generateHorizonSkirt(
       // A-17b: цветовой вход воды/русла больше не выводится косвенно из
       // высоты и нормали. Та же аналитическая Patch7-семантика действует по
       // обе стороны грани, не завися от грубой макро-решётки 33×33.
-      const semantic = smoothPatchBaseElevation(
-        patch, neighborSlots, centerCanonElev, radiusPatchM, x, y, r,
-      );
-      if (semantic.water >= 0.5) waterMask[vertex] = 255;
+      const semanticWater = skirtSemanticWater(patch, neighborSlots, radiusPatchM, x, y, r);
+      if (semanticWater >= 0.5) waterMask[vertex] = 255;
       const centerRiver = riverCarveFactor(x, y, centerRiverSegments, riverHalfWidthM);
       const skirtRiver = skirtRiverCarveFactor(
         patch, neighborSlots, x, y, r, radiusPatchM, riverHalfWidthM,
       );
-      if (semantic.water < 0.5 && Math.max(centerRiver, skirtRiver) >= 0.45) riverMask[vertex] = 255;
+      if (semanticWater < 0.5 && Math.max(centerRiver, skirtRiver) >= 0.45) riverMask[vertex] = 255;
     }
   }
 

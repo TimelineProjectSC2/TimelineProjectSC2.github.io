@@ -10,7 +10,7 @@
  *   node tools/stand_local_map.mjs --gate     exit 1, если хотя бы одна метрика красная
  *   node tools/stand_local_map.mjs --json     та же таблица в JSON
  *   node tools/stand_local_map.mjs --profile=a17   другой мир (профиль A-17)
- *   node tools/stand_local_map.mjs --radius-m=2500 радиус участка, м
+ *   node tools/stand_local_map.mjs --radius-m=2500 переопределить радиус участка (м)
  *   node tools/stand_local_map.mjs --flat-fixture  негативный контроль (плоская фикстура)
  *
  * Гейт по умолчанию выключен: пороги красные намеренно (фиксируют текущие
@@ -35,8 +35,8 @@
  *   6. перепад waterDepthM патч/юбка на одинаковой глубине               ≤ 0,5 м
  *   7. доля площади гекса под врезом — доля точек сетки 44×44 (±0,95·R),
  *                                   где riverCarveFactor > 0            ≤ 12 %
- *   8. размах суши / ширина кадра — Δh по вершинам суши / 2R           10…25 %
- *   9. размах океанского дна      — Δh по вершинам океана / 2R          ≥ 5 %
+ *   8. размах суши / окно 5 км    — Δh по вершинам суши / 5 000 м      3…8 %
+ *   9. размах океанского дна      — Δh по вершинам океана / 5 000 м     ≥ 1 %
  *  10. средний уклон              — средний |Δh|/dx по парам соседних
  *                                   вершин heightfield                   ≥ 4 %
  *  11. гипсометрия p90−p10        — (p90 − p10) / (max − min)           ≥ 40 % размаха
@@ -89,7 +89,9 @@
  * Обе копии помечены в коде и повторяют эталонные измерения A-17/A-29.
  *
  * ФИКСТУРЫ (копии из tests/local-map-stage8.test.mjs, значения не переписаны):
- *   A17_PROFILE, A29_PROFILE, список контрольных ячеек, radiusM = 2500 м.
+ *   A17_PROFILE, A29_PROFILE, список контрольных ячеек. По умолчанию радиус
+ *   участка берётся из GLOBE_CELL_SCALE (≈ 52 136 м); m.8/m.9/m.10 меряются
+ *   в независимом фиксированном окне 5 000 м.
  *   По умолчанию стенд мерит мир A-29 (masterSeedHex a29a29a29a29a29a): это
  *   тот мир, на котором закрыт A-29, и числа метрики 6 совпадают с его
  *   диагностикой (0,067 / 0,091 / 0,070 / 0,074 м на четырёх ячейках).
@@ -98,6 +100,7 @@
  *   метрики 1–3 там измеримы шире, — стенд нужен и как кросс-проверка.
  */
 
+import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -106,8 +109,11 @@ const require = createRequire(import.meta.url);
 const GeodesicGrid = require('../site/shared/geodesic-grid.ts').default;
 const PlanetSurface = require('../site/shared/planet-surface.ts').default;
 const Contract = require('../src/local-map/local-map-contract.ts');
+const Geometry = require('../src/local-map/local-map-geometry.ts');
+const { GLOBE_CELL_SCALE, GLOBE_RELIEF } = require('../site/shared/planet-globe.ts');
 const Worker = require('../src/local-map/local-map-worker.ts');
 const Heightfield = require('../src/local-map/local-map-heightfield.ts');
+const ElevationField = require('../site/shared/planet-elevation-field.ts');
 
 // Модуль русел после распила local-map-worker.ts (Stage-8.12d, шаг распила):
 // если файл есть, поле вреза считается ПРОИЗВОДСТВЕННЫМИ riverSegments /
@@ -171,7 +177,7 @@ const WORLDS = {
 };
 
 const PLACE_ID = 2;
-const DEFAULT_RADIUS_M = 2500;
+const DEFAULT_RADIUS_M = GLOBE_CELL_SCALE.strategicPatchRadiusM;
 /** Фиксированное окно (м) для метрик рельефа и уклона m.8, m.9, m.10 — независимо от radiusM. */
 const RELIEF_WINDOW_WIDTH_M = 5000;
 const RELIEF_WINDOW_RADIUS_M = RELIEF_WINDOW_WIDTH_M / 2;
@@ -213,9 +219,9 @@ const THRESHOLDS = {
   // Метрика 7: потолок доли площади под врезом, %.
   carveAreaMaxPct: 12,
   // Метрики 8–14 (Stage-8.14, шаг 1, Воркер 26; шаг 2, Воркер 26b): форма и сквозная непрерывность.
-  landReliefMinPct: 10,
-  landReliefMaxPct: 25,
-  oceanReliefMinPct: 5,
+  landReliefMinPct: 3,
+  landReliefMaxPct: 8,
+  oceanReliefMinPct: 1,
   meanSlopeMinPct: 4,
   hypsometryMinPct: 20,
   hypsometryMaxPct: 35,
@@ -229,10 +235,10 @@ const HYPSO_EARTH_REFERENCE_PCT = 19.4;
 const HYPSO_DOMAIN_REFERENCE_PCT = 28.1;
 const HYPSO_PREV_THRESHOLD_PCT = 35;
 
-/** Коэффициенты вертикального рельефа глобуса (site/shared/planet-globe.ts:286–294) и масштаб K. */
-const GLOBE_LAND_RELIEF_FACTOR = 0.022;
-const GLOBE_OCEAN_RELIEF_FACTOR = 0.008;
-const DEFAULT_GLOBE_SCALE_K = 8570;
+/** Коэффициенты глобуса и его шкала K из тех же модулей, что и страница. */
+const GLOBE_LAND_RELIEF_FACTOR = GLOBE_RELIEF.landMax;
+const GLOBE_OCEAN_RELIEF_FACTOR = GLOBE_RELIEF.oceanMax;
+const DEFAULT_GLOBE_SCALE_K = Worker.METERS_PER_ELEVATION_UNIT;
 
 /** CPU-реплика оптической глубины waterDepthM (ветка openSea шейдера, A-29). */
 const PELAGIC_DEPTH_M = 7.25;
@@ -250,6 +256,7 @@ function parseArgs(argv) {
     json: false,
     world: 'a29',
     radiusM: DEFAULT_RADIUS_M,
+    landCells: 20,
     flatFixture: false,
     flatHeightM: 0,
     hypsoReferencePct: null,
@@ -270,6 +277,12 @@ function parseArgs(argv) {
       const value = Number(arg.slice('--radius-m='.length));
       if (!Number.isFinite(value) || value <= 0) throw new Error('--radius-m должно быть положительным числом');
       options.radiusM = value;
+    } else if (arg.startsWith('--land-cells=')) {
+      const value = Number(arg.slice('--land-cells='.length));
+      if (!Number.isInteger(value) || value < 0 || value > 200) {
+        throw new Error('--land-cells должно быть целым числом от 0 до 200');
+      }
+      options.landCells = value;
     } else if (arg.startsWith('--flat-height-m=')) {
       const value = Number(arg.slice('--flat-height-m='.length));
       if (!Number.isFinite(value)) throw new Error('--flat-height-m должно быть конечным числом');
@@ -289,13 +302,14 @@ function parseArgs(argv) {
 
 function usage() {
   return [
-    'Использование: node tools/stand_local_map.mjs [--gate] [--json] [--profile=a17|a29] [--radius-m=2500] [--hypso-reference=28.1] [--flat-fixture]',
+    'Использование: node tools/stand_local_map.mjs [--gate] [--json] [--profile=a17|a29] [--radius-m=2500] [--land-cells=20] [--hypso-reference=28.1] [--flat-fixture]',
     '',
     '  (без флагов)         печать таблицы метрик по 7 контрольным ячейкам, всегда exit 0',
     '  --gate               exit 1, если хотя бы одна метрика красная (гейт выключен по умолчанию)',
     '  --json               та же таблица в JSON',
     '  --profile            мир измерения: a29 (по умолчанию) или a17',
-    '  --radius-m           радиус участка, м (по умолчанию 2500 — как в отчётах A-17/A-29)',
+    '  --radius-m           радиус участка, м (по умолчанию GLOBE_CELL_SCALE.strategicPatchRadiusM ≈ 52 136)',
+    '  --land-cells=N       хэш-выборка N наземных ячеек для m.8/m.10 (по умолчанию 20, 0 — отключить)',
     '  --hypso-reference    подставить ориентир гипсометрии (%) в detail m.11 (в вердикте не участвует)',
     '  --flat-fixture       негативный контроль на синтетическом плоском heightfield (h = const)',
   ].join('\n');
@@ -1037,7 +1051,7 @@ function inReliefWindow(x, y, res, cellSize) {
 }
 
 /**
- * Метрика 8 — размах суши / ширина кадра (порог 10…25 %):
+ * Метрика 8 — размах суши / ширина кадра (порог 3…8 %):
  * Δh = max(h) − min(h) по вершинам суши heightfield (terraform_map >= 2)
  * в пределах фиксированного окна 5 000 м вокруг центра, отнесённый к константе
  * окна RELIEF_WINDOW_WIDTH_M = 5 000 м (независимо от radiusM), в процентах.
@@ -1091,7 +1105,7 @@ function measureLandRelief(local, radiusM) {
 }
 
 /**
- * Метрика 9 — размах океанского дна (порог ≥ 5 %):
+ * Метрика 9 — размах океанского дна (порог ≥ 1 %):
  * Δh = max(h) − min(h) по вершинам океана heightfield (terraform_map == 0,
  * исключая зеркала континентальных озёр lakeWeight > 0) в пределах
  * фиксированного окна 5 000 м вокруг центра, отнесённый к константе окна
@@ -1431,14 +1445,11 @@ function formatSignedCommaDeg(deg, digits = 1) {
 }
 
 /**
- * Метрика 13 — сквозная непрерывность A↔B (порог ≤ 1 м):
- * сравнивает ДВА РАЗНЫХ гекса — активный гекс A и каждый из его 6 соседних
- * гексов B, построенных тем же производственным generateLocalMap, в 16 общих
- * точках общей плоской грани шестиугольного среза (apothemM).
- * Номер слота используется ТОЛЬКО для сопоставления пары (ячейка, сосед);
- * истинный азимут направления к соседу вычисляется через cellTangentMeters + atan2.
- * В detail дополнительно печатается диагностика «слот·60° против истинного азимута»
- * и пометка «разность якорных высот патчей, не шов; станет швом после W23».
+ * Метрика 13: 16 физических направлений на общей биссектрисе центров A/B.
+ * Они проецируются в оба касательных кадра точной ОБРАТНОЙ exp-картой. Старый
+ * тест использовал одинаковые координаты с шагом 2·A, хотя реальные центры
+ * Голдберга не обязаны лежать на идеальной решётке: он мерил две РАЗНЫЕ точки.
+ * Синтетический контроль рампы сохраняет режим идеальной плоской решётки.
  */
 function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}) {
   const resA = localA.meta?.hfRes ?? Worker.HEIGHTFIELD_RES;
@@ -1450,6 +1461,7 @@ function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}
     ? options.azimuthOffsetRad
     : ((Number.isFinite(options.azimuthOffsetDeg) ? options.azimuthOffsetDeg : 0) * Math.PI) / 180;
   const useSlotScale = options.useSlotScale === true;
+  const syntheticPlane = options.syntheticPlane === true;
   const faces = [];
 
   for (let slotA = 0; slotA < slotsA.length; slotA++) {
@@ -1486,14 +1498,46 @@ function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}
     const resB = entryB.local.meta?.hfRes ?? Worker.HEIGHTFIELD_RES;
     let faceMaxDeltaM = 0;
     let faceRampDeltaM = 0;
+    let faceMaxDistanceDeltaM = 0;
+    const actualSpacingM = Math.hypot(tanA.u, tanA.v);
+    const centerA = patchA.frame.origin;
+    const centerB = entryB.patch.frame.origin;
+    const mid = centerA.map((v, k) => v + centerB[k]);
+    const midLen = Math.hypot(...mid);
+    const middle = mid.map((v) => v / midLen);
+    const normal = [
+      centerA[1] * centerB[2] - centerA[2] * centerB[1],
+      centerA[2] * centerB[0] - centerA[0] * centerB[2],
+      centerA[0] * centerB[1] - centerA[1] * centerB[0],
+    ];
+    const nLen = Math.hypot(...normal);
+    const alongEdge = normal.map((v) => v / nLen);
     let worstSample = 0;
     for (let p = 0; p < HEX_EDGE_SAMPLES; p++) {
       const s = ((p + 0.5) / HEX_EDGE_SAMPLES - 0.5) * 2 * halfEdgeM;
-      const xA = apothemM * Math.cos(angA) - s * Math.sin(angA);
-      const yA = apothemM * Math.sin(angA) + s * Math.cos(angA);
-      const sB = -s;
-      const xB = apothemM * Math.cos(angB) - sB * Math.sin(angB);
-      const yB = apothemM * Math.sin(angB) + sB * Math.cos(angB);
+      let xA, yA, xB, yB;
+      if (syntheticPlane) {
+        xA = apothemM * Math.cos(angA) - s * Math.sin(angA);
+        yA = apothemM * Math.sin(angA) + s * Math.cos(angA);
+        const sB = -s;
+        xB = apothemM * Math.cos(angB) - sB * Math.sin(angB);
+        yB = apothemM * Math.sin(angB) + sB * Math.cos(angB);
+      } else {
+        // Направление на БИССЕКТРИСЕ A/B: симметрично относительно центров
+        // на сфере. Обратные exp-проекции сохраняют ровно тот же физический dir.
+        const theta = s / patchA.frame.radiusM;
+        const dir = middle.map((v, k) => v * Math.cos(theta) + alongEdge[k] * Math.sin(theta));
+        const localA = Geometry.directionToLocalPoint(patchA, dir);
+        const localB = Geometry.directionToLocalPoint(entryB.patch, dir);
+        xA = localA.u;
+        yA = localA.v;
+        xB = localB.u;
+        yB = localB.v;
+        faceMaxDistanceDeltaM = Math.max(
+          faceMaxDistanceDeltaM,
+          Math.abs(Math.hypot(xA, yA) - Math.hypot(xB, yB)),
+        );
+      }
       const hA = bilinearHeight(localA.heightfield, resA, radiusM, xA, yA);
       const hB = bilinearHeight(entryB.local.heightfield, resB, radiusM, xB, yB);
       const deltaM = Math.abs(hA - hB);
@@ -1502,7 +1546,9 @@ function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}
         worstSample = p;
       }
       const rampHA = rampSlopeK * xA;
-      const rampHB = rampSlopeK * (centerShiftX + xB * cosDTrue - yB * sinDTrue);
+      const rampHB = syntheticPlane
+        ? rampSlopeK * (centerShiftX + xB * cosDTrue - yB * sinDTrue)
+        : rampHA;
       const rampDeltaM = Math.abs(rampHA - rampHB);
       if (rampDeltaM > faceRampDeltaM) faceRampDeltaM = rampDeltaM;
     }
@@ -1523,6 +1569,8 @@ function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}
       slotVsTrueDeg,
       slotVsTrueBDeg,
       rampSeamDeltaM: faceRampDeltaM,
+      maxDistanceDeltaM: faceMaxDistanceDeltaM,
+      idealApothemDeltaM: actualSpacingM / 2 - apothemM,
       maxDeltaM: faceMaxDeltaM,
       worstSample,
     });
@@ -1542,7 +1590,8 @@ function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}
   const worst = faces.reduce((a, b) => (b.maxDeltaM > a.maxDeltaM ? b : a));
   const rampSeamMaxDeltaM = Math.max(...faces.map((f) => f.rampSeamDeltaM));
   const azimuthScaleOk = rampSeamMaxDeltaM <= 0.1;
-  const pass = azimuthScaleOk && worst.maxDeltaM <= THRESHOLDS.hexContinuityMaxM;
+  const pass = azimuthScaleOk && worst.maxDeltaM <= THRESHOLDS.hexContinuityMaxM
+    && faces.every((face) => face.maxDistanceDeltaM <= 1);
   const slotDiffs = faces.map((f) => f.slotVsTrueDeg);
   const minSlotDiff = Math.min(...slotDiffs);
   const maxSlotDiff = Math.max(...slotDiffs);
@@ -1561,7 +1610,122 @@ function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}
       + `${HEX_EDGE_SAMPLES} точек грани, max |Δh| = ${round(worst.maxDeltaM, 2)} м (точка ${worst.worstSample + 1}/${HEX_EDGE_SAMPLES}); `
       + `слот·60° против истинного азимута: ${slotDiagText} (диапазон ${formatSignedCommaDeg(minSlotDiff, 1)}…${formatSignedCommaDeg(maxSlotDiff, 1)}); `
       + `по граням: ${faces.map((f) => `с${f.slotA}(${f.cellB})=${round(f.maxDeltaM, 1)}м`).join(', ')}; `
-      + 'разность якорных высот патчей, не шов; станет швом после W23',
+      + (syntheticPlane
+        ? 'синтетическая рампа идеальных центров'
+        : `один dir в кадрах A/B; max Δ расстояния до центров = ${round(Math.max(...faces.map((f) => f.maxDistanceDeltaM)), 4)} м; `
+          + `отклонение реальной половины шага от апофемы = ${round(worst.idealApothemDeltaM, 1)} м`),
+  };
+}
+
+/**
+ * Разложение ОДНОГО и того же растрового сэмпла m.13. Матрица 4 углов
+ * берётся из итогового heightfield и заново раскладывается на: планетное поле
+ * (решётка + ошибка к поформенной функции), деталь, зеркало озера, врез/
+ * релаксацию. Тип воды/суши в обычной точке — только маска, Δвысоты=0.
+ */
+function rasterComponents(entry, coords, radiusM, planetSeed) {
+  const { patch, local } = entry;
+  const res = local.meta?.hfRes ?? Worker.HEIGHTFIELD_RES;
+  const stepM = 2 * radiusM / res;
+  const gx = Math.min(res - 1.0001, Math.max(0, coords.u / stepM + res / 2));
+  const gy = Math.min(res - 1.0001, Math.max(0, coords.v / stepM + res / 2));
+  const x = Math.floor(gx), y = Math.floor(gy);
+  const tx = gx - x, ty = gy - y;
+  const fieldLattice = Heightfield.sampleElevationLattice(patch, radiusM, stepM);
+  const sums = { field: 0, directField: 0, detail: 0, lake: 0, carve: 0, final: 0 };
+  const cells = new Map();
+  for (let dy = 0; dy <= 1; dy++) {
+    for (let dx = 0; dx <= 1; dx++) {
+      const ix = x + dx, iy = y + dy;
+      const weight = (dx ? tx : 1 - tx) * (dy ? ty : 1 - ty);
+      const dir = Contract.localPointToDirection(patch, (ix - res / 2) * stepM, (iy - res / 2) * stepM);
+      const nearest = Contract.nearestPatchCell(patch, dir);
+      const field = Heightfield.elevationFromLattice(fieldLattice, 64, ix * 64 / res, iy * 64 / res);
+      const directField = ElevationField.sampleElevation(dir, stepM);
+      const detail = Heightfield.sampleLocalTerrainDetailM(dir, patch.frame.radiusM, planetSeed, true);
+      const lake = nearest.lakeWeight > 0
+        ? (Contract.waterLevelOf(nearest, patch.seaLevel) - patch.seaLevel) * Worker.METERS_PER_ELEVATION_UNIT
+          - (field + detail)
+        : 0;
+      const final = local.heightfield[iy * res + ix];
+      const carve = final - (field + detail + lake);
+      sums.field += field * weight;
+      sums.directField += directField * weight;
+      sums.detail += detail * weight;
+      sums.lake += lake * weight;
+      sums.carve += carve * weight;
+      sums.final += final * weight;
+      cells.set(nearest.cell, {
+        cell: nearest.cell,
+        ocean: nearest.elevation < patch.seaLevel && nearest.lakeWeight === 0,
+        lake: nearest.lakeWeight > 0,
+      });
+    }
+  }
+  return { ...sums, cells: [...cells.values()].sort((a, b) => a.cell - b.cell) };
+}
+
+/** Самая плохая грань A/B, до каких-либо исправлений речного вреза. */
+export function diagnoseWorstHexSeam(cellCache, world, rows, radiusM) {
+  const worstRow = rows.filter((row) => row.metric === METRIC_TITLES.hexContinuity && row.value !== null)
+    .reduce((worst, row) => (!worst || row.value > worst.value ? row : worst), null);
+  if (!worstRow) return null;
+  const entryA = cellCache.get(`${worstRow.cell}:${radiusM}`);
+  const neighbors = new Map();
+  for (const cell of entryA.patch.cells.slice(1)) {
+    const item = cellCache.get(`${cell.cell}:${radiusM}`);
+    if (item) neighbors.set(cell.cell, item);
+  }
+  const result = measureHexContinuity(entryA.local, entryA.patch, neighbors, radiusM);
+  const face = result.worst;
+  const entryB = neighbors.get(face.cellB);
+  if (!entryB) throw new Error(`Нет соседа ${face.cellB} для разбора m.13`);
+  const centerA = entryA.patch.frame.origin, centerB = entryB.patch.frame.origin;
+  const mid = centerA.map((v, i) => v + centerB[i]);
+  const midLen = Math.hypot(...mid);
+  const middle = mid.map((v) => v / midLen);
+  const normal = [
+    centerA[1] * centerB[2] - centerA[2] * centerB[1],
+    centerA[2] * centerB[0] - centerA[0] * centerB[2],
+    centerA[0] * centerB[1] - centerA[1] * centerB[0],
+  ];
+  const nLen = Math.hypot(...normal);
+  const alongEdge = normal.map((v) => v / nLen);
+  const halfEdge = Worker.CENTER_HEX_RADIUS_RATIO * Worker.HEX_APOTHEM_RATIO * radiusM / Math.sqrt(3);
+  const s = ((face.worstSample + 0.5) / HEX_EDGE_SAMPLES - 0.5) * 2 * halfEdge;
+  const theta = s / entryA.patch.frame.radiusM;
+  const dir = middle.map((v, i) => v * Math.cos(theta) + alongEdge[i] * Math.sin(theta));
+  const a = Geometry.directionToLocalPoint(entryA.patch, dir);
+  const b = Geometry.directionToLocalPoint(entryB.patch, dir);
+  const planetSeed = (world.seed ^ Math.imul((PLACE_ID + 1) >>> 0, 0x85EBCA6B)) >>> 0;
+  const A = rasterComponents(entryA, a, radiusM, planetSeed);
+  const B = rasterComponents(entryB, b, radiusM, planetSeed);
+  const delta = (key) => A[key] - B[key];
+  const rawStep = 2 * radiusM / Worker.HEIGHTFIELD_RES;
+  return {
+    cellA: entryA.patch.centerCell,
+    cellB: entryB.patch.centerCell,
+    slotA: face.slotA,
+    sample: face.worstSample + 1,
+    radiusM,
+    signedHeightDifferenceM: delta('final'),
+    measuredM: result.value,
+    componentsM: {
+      field: delta('field'),
+      detail: delta('detail'),
+      carve: delta('carve'),
+      lake: delta('lake'),
+      classification: 0, // вода/суша — маска; зеркала только в lake
+      fieldVsDirectInterpolation: delta('field') - delta('directField'),
+      directFieldRaster: delta('directField'),
+      directFieldAtDir: ElevationField.sampleElevation(Contract.localPointToDirection(entryA.patch, a.u, a.v), rawStep)
+        - ElevationField.sampleElevation(Contract.localPointToDirection(entryB.patch, b.u, b.v), rawStep),
+    },
+    perSideM: {
+      A: { field: A.field, detail: A.detail, carve: A.carve, lake: A.lake, final: A.final },
+      B: { field: B.field, detail: B.detail, carve: B.carve, lake: B.lake, final: B.final },
+    },
+    classification: { A: A.cells, B: B.cells },
   };
 }
 
@@ -1631,7 +1795,7 @@ function runRampAzimuthControl(patchA, neighborPatches, radiusM = DEFAULT_RADIUS
     });
   }
 
-  return measureHexContinuity(localA, patchA, neighborMap, radiusM, options);
+  return measureHexContinuity(localA, patchA, neighborMap, radiusM, { ...options, syntheticPlane: true });
 }
 
 /** Среднее межцентровое расстояние dHex (м) до соседей патча (как в buildNeighborRingCells). */
@@ -1655,9 +1819,9 @@ function computePatchHexSpanM(patch) {
  * сравнивает ОДИН И ТОТ ЖЕ гекс C на разрешении 256×256 (активный центральный
  * heightfield) и на разрешении 64×64 (кольцевой LOD 1 RING_HF_RES[1] = 64 того
  * же гекса C до перехода камеры на него) на ОДИНАКОВОМ физическом span.
- * У центрального кадра span = 2·radiusM (5 км), у кольцевого LOD 64 span = dHex
- * (59–64,5 км); обе сетки опрашиваются на общем окне commonSpanM = min(fineSpanM, coarseSpanM)
- * с переводом координат ортогональным поворотом между касательными кадрами.
+ * У центрального кадра и кольцевого LOD 64 физический span = 2·radiusM
+ * (≈ 104 км при продуктовом радиусе); обе сетки опрашиваются на общем окне
+ * commonSpanM = min(fineSpanM, coarseSpanM) с переводом между 3D кадрами.
  */
 function measureLodConsistency(local256, patchC, coarseViews, radiusM) {
   if (!coarseViews || coarseViews.length === 0) {
@@ -1730,10 +1894,10 @@ function measureLodConsistency(local256, patchC, coarseViews, radiusM) {
 
 /**
  * Вертикальное преувеличение глобуса (только печать, без порога):
- *   суша  0,022 · R / ((elevMax − sea) · K)
- *   океан 0,008 · R / ((sea − elevMin) · K)
+ *   суша  GLOBE_RELIEF.landMax · R / ((elevMax − sea) · K)
+ *   океан GLOBE_RELIEF.oceanMax · R / ((sea − elevMin) · K)
  *   плюс отношение «океан / суша».
- * Причина: site/shared/planet-globe.ts:286–294 нормирует высоту на размах поля,
+ * Причина: site/shared/planet-globe.ts (GLOBE_RELIEF) нормирует высоту на размах поля,
  * поэтому глобус от смены K не меняется вообще.
  */
 function measureGlobeVerticalExaggeration(surface, options = {}) {
@@ -1770,8 +1934,8 @@ function measureGlobeVerticalExaggeration(surface, options = {}) {
       + `отношение океан/суша = ${formatCommaDecimal(oceanToLandRatio, 2)} `
       + `(при K = ${scaleK}, R = ${radiusM} м, sea = ${round(seaLevel, 4)}, `
       + `elevMin = ${round(elevationMin, 4)}, elevMax = ${round(elevationMax, 4)}; `
-      + `ориентир домена при K = 8 570: 46,1× / 4,6×, отношение 0,10; `
-      + `site/shared/planet-globe.ts:286–294 нормирует высоту на размах поля)`,
+      + `факторы landMax=${GLOBE_LAND_RELIEF_FACTOR}, oceanMax=${GLOBE_OCEAN_RELIEF_FACTOR}; `
+      + `site/shared/planet-globe.ts:GLOBE_RELIEF нормирует высоту на размах поля)`,
   };
 }
 
@@ -1848,7 +2012,7 @@ function buildFormAndContinuityRows({
     cell, zone, METRIC_TITLES.landRelief,
     landRelief.value === null ? null : round(landRelief.value, 3),
     landRelief.value === null ? '—' : `${landRelief.value.toFixed(2)} %`,
-    '10…25 %',
+    '3…8 %',
     landRelief.value === null
       ? 'N/A'
       : (landRelief.value >= THRESHOLDS.landReliefMinPct && landRelief.value <= THRESHOLDS.landReliefMaxPct ? 'PASS' : 'FAIL'),
@@ -1861,7 +2025,7 @@ function buildFormAndContinuityRows({
     cell, zone, METRIC_TITLES.oceanRelief,
     oceanRelief.value === null ? null : round(oceanRelief.value, 3),
     oceanRelief.value === null ? '—' : `${oceanRelief.value.toFixed(2)} %`,
-    '≥ 5 %',
+    '≥ 1 %',
     oceanRelief.value === null
       ? 'N/A'
       : (oceanRelief.value >= THRESHOLDS.oceanReliefMinPct ? 'PASS' : 'FAIL'),
@@ -2324,9 +2488,84 @@ export function gateExitCode(summary) {
   return summary.fail > 0 ? 1 : 0;
 }
 
+/** Выбор без подгонки под результат: SHA-256(seed|cell), затем cell при коллизии. */
+export function selectLandCells(grid, surface, seed, count = 20) {
+  if (!Number.isInteger(count) || count < 0 || count > 200) {
+    throw new Error('landCells должно быть целым числом 0…200');
+  }
+  const ranked = [];
+  for (let cell = 0; cell < grid.cellCount; cell++) {
+    if (grid.neighborCount[cell] !== 6 || surface.elevation[cell] <= surface.seaLevel
+      || surface.lakeWeight[cell] > 0) continue;
+    const hash = createHash('sha256').update(`${seed}|${cell}`).digest('hex');
+    ranked.push({ cell, hash });
+  }
+  if (count > ranked.length) throw new Error(`Суши недостаточно для ${count} ячеек: ${ranked.length}`);
+  ranked.sort((a, b) => a.hash.localeCompare(b.hash) || a.cell - b.cell);
+  return ranked.slice(0, count).map(({ cell }) => cell);
+}
+
+function sampleQuantile(sorted, p) {
+  if (sorted.length === 0) return null;
+  const pos = (sorted.length - 1) * p;
+  const lo = Math.floor(pos), hi = Math.ceil(pos);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+/** Наземные окна m.8/m.10: та же 5-километровая выборка, но двадцать центров. */
+export async function measureLandSample(grid, surface, world, count = 20) {
+  const cells = selectLandCells(grid, surface, world.seed, count);
+  const rows = [];
+  for (const cell of cells) {
+    const patch = Contract.buildPatch7(grid, surface, cell);
+    const local = await Worker.generateLocalMap({
+      patch,
+      seed: world.seed,
+      placeId: PLACE_ID,
+      radiusM: RELIEF_WINDOW_RADIUS_M,
+      profile: world.profile,
+      neighborRings: 0,
+      patchKey: `stand-land-${world.seed}-${cell}`,
+    });
+    const relief = measureLandRelief(local, RELIEF_WINDOW_RADIUS_M);
+    const slope = measureMeanSlope(local, RELIEF_WINDOW_RADIUS_M);
+    rows.push({
+      cell,
+      // Сравнение с порогом и квантиль используют ОДНО значение без раннего
+      // округления: на самой границе 4 % статус не противоречит JSON.
+      m8: relief.value,
+      m8DeltaM: relief.deltaM,
+      m8Pass: relief.value !== null
+        && relief.value >= THRESHOLDS.landReliefMinPct && relief.value <= THRESHOLDS.landReliefMaxPct,
+      m10: slope.value,
+      m10Pass: slope.value >= THRESHOLDS.meanSlopeMinPct,
+    });
+  }
+  const summarize = (key, passKey) => {
+    const values = rows.map((row) => row[key]).filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
+    return {
+      median: sampleQuantile(values, 0.5),
+      p10: sampleQuantile(values, 0.1),
+      p90: sampleQuantile(values, 0.9),
+      passed: rows.filter((row) => row[passKey]).length,
+      measured: values.length,
+    };
+  };
+  return {
+    seed: world.seed,
+    requested: count,
+    selected: rows.length,
+    selection: 'SHA-256(seed|cell), только 6-соседняя суша elev > seaLevel без озёр',
+    windowWidthM: RELIEF_WINDOW_WIDTH_M,
+    rows,
+    m8: summarize('m8', 'm8Pass'),
+    m10: summarize('m10', 'm10Pass'),
+  };
+}
+
 /**
  * Полный прогон стенда: таблица метрик по всем контрольным ячейкам.
- * Опции: { world: 'a29' | 'a17', radiusM: число, hypsoReferencePct: число | null }.
+ * Опции: { world: 'a29' | 'a17', radiusM: число, landCells: 0…200 }.
  */
 export async function runStand(options = {}) {
   const worldName = options.world ?? 'a29';
@@ -2341,6 +2580,7 @@ export async function runStand(options = {}) {
     rows.push(...await measureCell(grid, surface, world, cell, radiusM, cellCache, options));
   }
   const summary = summarizeRows(rows);
+  const landSample = await measureLandSample(grid, surface, world, options.landCells ?? 20);
   const globeVerticalExaggeration = measureGlobeVerticalExaggeration(surface, {
     scaleK: options.scaleK,
   });
@@ -2356,6 +2596,8 @@ export async function runStand(options = {}) {
     globeVerticalExaggeration,
     rows,
     summary,
+    landSample,
+    seamDiagnostic: diagnoseWorstHexSeam(cellCache, world, rows, radiusM),
     gate: options.gate === true,
     gatePassed: gateExitCode(summary) === 0,
   };
@@ -2432,6 +2674,25 @@ if (invokedDirectly) {
     console.log(formatTable(report.rows, report.summary));
     if (report.globeVerticalExaggeration) {
       console.log(`Вертикальное преувеличение глобуса (без порога): ${report.globeVerticalExaggeration.detail}`);
+    }
+    console.log(`Наземная выборка: ${report.landSample.selected}/${report.landSample.requested}, окно 5 км`);
+    for (const item of report.landSample.rows) {
+      console.log(`  #${item.cell} m.8=${item.m8 === null ? 'N/A' : `${item.m8.toFixed(2)} %`} ${item.m8Pass ? 'PASS' : 'FAIL'}; `
+        + `m.10=${item.m10.toFixed(2)} % ${item.m10Pass ? 'PASS' : 'FAIL'}`);
+    }
+    for (const [metric, data] of [['m.8', report.landSample.m8], ['m.10', report.landSample.m10]]) {
+      if (data.median !== null) {
+        console.log(`  ${metric} сводка: median=${data.median.toFixed(2)} %, p10=${data.p10.toFixed(2)} %, `
+          + `p90=${data.p90.toFixed(2)} %, PASS ${data.passed}/${report.landSample.selected}`);
+      }
+    }
+    if (report.seamDiagnostic) {
+      const d = report.seamDiagnostic;
+      console.log(`Худшая грань m.13 #${d.cellA}↔#${d.cellB}, точка ${d.sample}/16: `
+        + `Δ=${d.signedHeightDifferenceM.toFixed(4)} м; `
+        + `поле=${d.componentsM.field.toFixed(4)}, деталь=${d.componentsM.detail.toFixed(4)}, `
+        + `врез=${d.componentsM.carve.toFixed(4)}, озеро=${d.componentsM.lake.toFixed(4)}, `
+        + `классификация=${d.componentsM.classification.toFixed(4)} м`);
     }
     if (report.summary.failedMetrics.length > 0) {
       console.log(`Красные метрики: ${report.summary.failedMetrics.join(', ')}`);

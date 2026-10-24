@@ -49,6 +49,8 @@ export interface RingCellLike {
   readonly center: readonly [number, number, number];
   readonly offsetM: readonly [number, number];
   readonly hfRes: number;
+  /** Ширина сетки сэмплов кольца; по умолчанию ширина GPU-квадрата 2·R_patch. */
+  readonly spanM?: number;
   readonly heightfield: Float32Array;
   readonly waterMask: Uint8Array;
   readonly minHeightM: number;
@@ -753,7 +755,7 @@ export class StructureRenderer {
     lines: number,
   ): void {
     const { cell, res } = item;
-    const cellSize = (2 * radiusM) / res;
+    const cellSize = (cell.spanM ?? 2 * radiusM) / res;
     const [offsetX, offsetY] = cell.offsetM;
     const scratch = this.scratch;
     let out = 0;
@@ -771,8 +773,8 @@ export class StructureRenderer {
 
   /** Локальные XY для гексагонального среза без uniform на каждую ячейку. */
   private fillRingLocal(item: RingDrawItem, radiusM: number, from: number, lines: number): void {
-    const res = item.res;
-    const cellSize = (2 * radiusM) / res;
+    const { cell, res } = item;
+    const cellSize = (cell.spanM ?? 2 * radiusM) / res;
     const scratch = this.scratch;
     let out = 0;
     for (let y = from; y < from + lines; y++) {
@@ -791,7 +793,7 @@ export class StructureRenderer {
     lines: number,
   ): void {
     const { cell, res } = item;
-    const cellSize = (2 * radiusM) / res;
+    const cellSize = (cell.spanM ?? 2 * radiusM) / res;
     const heightfield = cell.heightfield;
     const scratch = this.scratch;
     let out = 0;

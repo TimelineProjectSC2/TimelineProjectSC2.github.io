@@ -19,6 +19,8 @@
    Сферическое проседание Δz = R_p − sqrt(R_p² − r²) выполняется в вершинных
    шейдерах по uniform u_planetRadiusM (0.0 — плоская карта, старое поведение). */
 
+import { CENTER_HEX_APOTHEM_RATIO } from './local-map-geometry.ts';
+
 // ============================================================
 //  structure.vert — Instanced structures vertex shader
 // ============================================================
@@ -302,14 +304,15 @@ void main() {
   float ringFade = isRing ? clamp(u_ringFade, 0.0, 1.0) : 0.0;
   float dist = length(v_worldPos.xy);
   // Апофема активного центрального гекса и гексагональная метрика (ориентация clusterHexMetric: yx).
-  float hexApothem = u_focusRadiusM * 0.8054;
+  float hexApothem = u_focusRadiusM * ${CENTER_HEX_APOTHEM_RATIO.toFixed(3)};
   float centerHexDist = hexMetric2D(v_worldPos.yx);
   float ringHexDist = isRing ? hexMetric2D(v_ringLocal.yx) : 0.0;
 
   // Центральный участок обрезается строгим правильным шестиугольником:
   // 6 прямых сторон активного гекса (с микрозапасом 1.003 для бесшовного
-  // перекрытия с воротником юбки) и страховочное круговое отсечение 0.935·R_patch.
-  if (isCentral && u_focusRadiusM > 1.0 && dist > u_focusRadiusM * 0.935) {
+  // перекрытия с воротником юбки). Страховочное круглое отсечение теперь
+  // покрывает и вершины гекса (R_описанный ≈ 0,66395·R_patch).
+  if (isCentral && u_focusRadiusM > 1.0 && dist > u_focusRadiusM * ${((CENTER_HEX_APOTHEM_RATIO / (Math.sqrt(3) / 2)) * 1.01).toFixed(6)}) {
     discard;
   }
   if (isCentral && u_focusRadiusM > 1.0 && centerHexDist > hexApothem * 1.003) {
