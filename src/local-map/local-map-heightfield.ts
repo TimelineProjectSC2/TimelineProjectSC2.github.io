@@ -1,11 +1,10 @@
-/* LocalMap heightfield — базовый рельеф локальной карты (Stage-8.12d, распил local-map-worker.ts).
-   Модуль 1 из трёх: здесь fBm и канал detail (И-3.1), якорь Patch7 (И-3.2),
-   гладкая интерполяция Patch7 (Stage-8.5), батиметрия океана (A-29), кольца
-   соседних гексов (A-17) и терраформинг. Врез русла — local-map-rivers.ts;
-   оркестрация — local-map-worker.ts. Формулы и порядок операций не меняются. */
+/* LocalMap heightfield — базовый рельеф локальной карты (Stage-8.14, W23).
+   Физическая высота берётся из sampleElevation в каждой вершине, поверх неё
+   накладывается общий для всей планеты fBm/detail. Patch7 задаёт маски
+   воды/озёр/рек, но НЕ патч-зависимый якорь высоты. Кольца LOD используют
+   то же поле; врез русла — local-map-rivers.ts, оркестрация — worker.ts. */
 
 import {
-  baseElevationOf,
   isWaterCell,
   localPointToDirection,
   nearestPatchCell,
@@ -14,7 +13,8 @@ import {
 } from './local-map-contract.ts';
 import type { LocalMapPatch, PatchCell, Vec3 } from './local-map-contract.ts';
 import type { FieldSampler } from '../../site/shared/planet-geography.ts';
-import { SKIRT_RING_COUNT, mapNeighborCellsToSlots } from './local-map-geometry.ts';
+import { CENTER_HEX_APOTHEM_RATIO, SKIRT_RING_COUNT } from './local-map-geometry.ts';
+import { sampleElevation } from '../../site/shared/planet-elevation-field.ts';
 
 // ---- Константы рельефа и терраформинга ----
 // ---- Константы контракта ----
@@ -22,43 +22,27 @@ export const HEIGHTFIELD_RES = 256;
 
 export const TERRAFORM_RES = 256;
 
-/** Метры рельефа на единицу канонической высоты c100-soft-v2 (И-3.2). */
-export const METERS_PER_ELEVATION_UNIT = 900;
+/** Вертикальная шкала канонических высот (медиана суши Земли ≈ 600 м). */
+export const METERS_PER_ELEVATION_UNIT = 8570;
 
-/** Амплитуда локального fBm-рельефа на суше, м. */
-export const LAND_FBM_AMPLITUDE_M = 80;
+/** Амплитуда локального fBm-рельефа суши и морского дна, м. */
+export const LAND_FBM_AMPLITUDE_M = 240;
 
-/** Амплитуда канала `detail` единого 3D-сэмплера, м (И-3.1). */
-export const PROFILE_DETAIL_AMPLITUDE_M = 40;
+/** Амплитуда дополнительной детали суши и морского дна, м. */
+export const PROFILE_DETAIL_AMPLITUDE_M = 120;
 
-/** Узлов решётки кэширования канала `detail` на сторону (65×65 опросов). */
+/** Старая диагностическая решётка 65²; итоговые высоты W23 из неё не читаются. */
 export const DETAIL_LATTICE_STEPS = 64;
 
 /**
- * Stage-8.5: радиальная доля `radiusM` — ядро активного гекса, внутри которого
- * вес центральной ячейки Patch7 равен 1.0, а соседние ячейки ещё не подмешаны.
+ * Исторические коэффициенты полосы 0.62…1.02 Stage-8.5 сохранены для
+ * совместимости диагностик; W23 НЕ умножает на них высоту sampleElevation.
+ * Новый воротник юбки смешивается отдельно в полосе 1.005…1.35 апофемы.
  */
 export const LOCAL_HEX_CORE_RADIUS_RATIO = 0.85;
-
-/**
- * Stage-8.5: доли настоящей границы Вороного центральной ячейки Patch7 для
- * ПОДЪЁМА к более высокому угловому слоту. Плавный вывод высоты начинается в
- * `0.62` и завершается в `1.02` от расстояния до границы по лучу, поэтому
- * макро-подъём между ячейками проходится плавно ДО границы, а не скачком на ней.
- */
 export const LOCAL_PATCH_RAMP_START_RATIO = 0.62;
-
 export const LOCAL_PATCH_RAMP_END_RATIO = 1.02;
-
-/**
- * Stage-8.5: доли границы Вороного для СПУСКА к более низкому угловому слоту.
- * Спуск начинается ровно на границе (`1.0`) и заканчивается у центра соседней
- * ячейки (`1.85`): инвариант И-3.2 («суша не ныряет ниже канонической высоты
- * своей ячейки») запрещает опускаться до границы, поэтому склон уходит вниз
- * уже на территории низкой ячейки — обрыва на самой границе нет.
- */
 export const LOCAL_PATCH_FALL_START_RATIO = 1.0;
-
 export const LOCAL_PATCH_FALL_END_RATIO = 1.85;
 
 /**
@@ -102,6 +86,8 @@ export interface LocalMapRingCell {
   readonly offsetM: readonly [number, number];
   /** Разрешение heightfield ячейки (RING_HF_RES[ring]). */
   readonly hfRes: number;
+  /** Физический span сэмплов, м; равен span GPU-геометрии = 2·R_patch. */
+  readonly spanM: number;
   /** Heightfield ячейки кольца, м относительно seaLevel. */
   readonly heightfield: Float32Array;
   /** 1 — точка ниже уровня воды ячейки (море), 0 — суша. */
@@ -128,11 +114,11 @@ export const MAX_RING_CELLS = 91;
 /** √3/2 — отношение апофемы правильного шестиугольника к радиусу описанной окружности. */
 export const HEX_APOTHEM_RATIO = 0.8660254037844386;
 
-/** Доля R_patch: радиус описанной окружности выделенного центрального гекса. */
-export const CENTER_HEX_RADIUS_RATIO = 0.93;
-
 /** Доля R_patch: шаг центров соседних гексов канонической сетки кластера Patch7. */
 export const SKIRT_HEX_SPACING_RATIO = 1.15;
+
+/** Радиус описанной окружности: апофема 1,15·R/2, радиус = апофема/(√3/2). */
+export const CENTER_HEX_RADIUS_RATIO = CENTER_HEX_APOTHEM_RATIO / HEX_APOTHEM_RATIO;
 
 // ---- Детерминированный хэш (pcg-подобный) ----
 function pcgHash(state: number): number {
@@ -305,65 +291,30 @@ function hexRingAxial(ring: number): Array<[number, number]> {
 }
 
 /**
- * Stage-8.7: билинейная интерполяция решётки L×L в сетку res×res.
- */
-function bilinearLattice(lat: Float32Array, latSteps: number, fx: number, fy: number): number {
-  const x = Math.min(latSteps - 1.0001, Math.max(0, fx));
-  const y = Math.min(latSteps - 1.0001, Math.max(0, fy));
-  const ix = Math.floor(x);
-  const iy = Math.floor(y);
-  const ax = x - ix;
-  const ay = y - iy;
-  const i00 = iy * latSteps + ix;
-  const i10 = i00 + 1;
-  const i01 = i00 + latSteps;
-  const i11 = i01 + 1;
-  const top = (lat[i00] as number) * (1 - ax) + (lat[i10] as number) * ax;
-  const bottom = (lat[i01] as number) * (1 - ax) + (lat[i11] as number) * ax;
-  return top * (1 - ay) + bottom * ay;
-}
-
-/**
- * Stage-8.7: heightfield одной ячейки кольца через единый 3D-сэмплер Patch7.
- * Решётка L×L (L = max(2, res/4)) опрашивает сэмплер, а сетка res×res
- * получается билинейной интерполяцией — тот же паттерн, что у детального
- * решёточного канала центра (sampleDetailLattice), без новых формул рельефа.
- * waterMask = 1 там, где высота ниже уровня воды ячейки (море, seaLevel);
- * русла рек в кольцах за пределами Patch7 не детектируются — патч несёт
- * топологию рек только для кольца 0..1, а детальный центр уже вырезает русла.
+ * Heightfield кольца использует тот же сэмпл физического поля, что центральный
+ * гекс, на собственном шаге span/res. Ширина span = 2·R_patch соответствует
+ * координатам вершин рендерера; прежний span = dHex ≈ 1,15·R_patch при
+ * физической геометрии 2·R_patch заставлял LOD означать другую точку.
  */
 function buildRingCellHeightfield(
   patch: LocalMapPatch,
-  sampler: FieldSampler,
   offsetX: number,
   offsetY: number,
   res: number,
   span: number,
-  seaLevel: number,
-  scratch: Float32Array,
+  planetSeed: number,
+  withDetail: boolean,
 ): { heightfield: Float32Array; waterMask: Uint8Array } {
-  const latSteps = Math.max(2, Math.min(res, Math.round(res / 5)));
-  const lat = new Float32Array(latSteps * latSteps);
-  for (let j = 0; j < latSteps; j++) {
-    const wy = offsetY + (j / (latSteps - 1) - 0.5) * span;
-    for (let i = 0; i < latSteps; i++) {
-      const wx = offsetX + (i / (latSteps - 1) - 0.5) * span;
-      const dir = localPointToDirection(patch, wx, wy);
-      const fields = sampler.sampleFields(dir[0], dir[1], dir[2], scratch);
-      lat[j * latSteps + i] = (fields[0] as number - seaLevel) * METERS_PER_ELEVATION_UNIT;
-    }
-  }
   const heightfield = new Float32Array(res * res);
   const waterMask = new Uint8Array(res * res);
-  const cellSize = span / res;
+  const stepM = span / res;
   for (let y = 0; y < res; y++) {
-    const wy = offsetY + (y - res / 2) * cellSize;
-    const fy = ((wy - (offsetY - span / 2)) / span) * (latSteps - 1);
+    const wy = offsetY + (y - res / 2) * stepM;
     for (let x = 0; x < res; x++) {
-      const wx = offsetX + (x - res / 2) * cellSize;
-      const fx = ((wx - (offsetX - span / 2)) / span) * (latSteps - 1);
+      const wx = offsetX + (x - res / 2) * stepM;
+      const dir = localPointToDirection(patch, wx, wy);
+      const h = sampleLocalTerrainHeightM(dir, stepM, patch.frame.radiusM, planetSeed, withDetail);
       const idx = y * res + x;
-      const h = bilinearLattice(lat, latSteps, fx, fy);
       heightfield[idx] = h;
       waterMask[idx] = h < 0 ? 1 : 0;
     }
@@ -380,10 +331,10 @@ function buildRingCellHeightfield(
  */
 export function buildNeighborRingCells(
   patch: LocalMapPatch,
-  sampler: FieldSampler,
   neighborRings: number,
-  seaLevel: number,
   radiusPatchM: number,
+  planetSeed: number,
+  withDetail: boolean,
 ): LocalMapRingCell[] {
   const normAngle = (a: number): number => (a + 2 * Math.PI) % (2 * Math.PI);
   const sorted: Array<{ cell: PatchCell; off: Tangent2D; angle: number }> = [];
@@ -402,7 +353,6 @@ export function buildNeighborRingCells(
   // же соседний центр на 2.875 км: две поверхности описывали разные места.
   const visualHexSpacingM = SKIRT_HEX_SPACING_RATIO * radiusPatchM;
   const visualScale = visualHexSpacingM / Math.max(1, dHex);
-  const scratch = new Float32Array(8);
   const ringCells: LocalMapRingCell[] = [];
   let cellIndex = 0;
   for (let ring = 1; ring <= neighborRings; ring++) {
@@ -425,8 +375,9 @@ export function buildNeighborRingCells(
     }
     for (const entry of entries) {
       const center = entry.center ?? localPointToDirection(patch, entry.x, entry.y);
+      const spanM = 2 * radiusPatchM;
       const built = buildRingCellHeightfield(
-        patch, sampler, entry.x, entry.y, hfRes, dHex, seaLevel, scratch,
+        patch, entry.x, entry.y, hfRes, spanM, planetSeed, withDetail,
       );
       let minH = Infinity;
       let maxH = -Infinity;
@@ -444,6 +395,7 @@ export function buildNeighborRingCells(
         center,
         offsetM: [entry.x * entryScale, entry.y * entryScale],
         hfRes,
+        spanM,
         heightfield: built.heightfield,
         waterMask: built.waterMask,
         minHeightM: minH === Infinity ? 0 : minH,
@@ -455,9 +407,9 @@ export function buildNeighborRingCells(
 }
 
 /**
- * Канал `detail` единого 3D-сэмплера (И-3.1) на решётке 65×65 узлов с
- * билинейной интерполяцией: 4 225 опросов вместо 65 536 держат гейт G4
- * (генерация <= 150 мс) при сохранении непрерывности поля (И-3.1).
+ * Старая диагностическая решётка 65² (в т. ч. для tools/analysis/ocean_side).
+ * W23 не использует её для генерации: каждая вершина выбирает sampleElevation
+ * по собственному направлению и шагу 2·R/hfRes. Старый выигрыш G4 утрачен.
  */
 export interface LocalFieldLattice {
   readonly elevation: Float32Array;
@@ -500,292 +452,6 @@ export function sampleDetailAt(lattice: Float32Array, tx: number, ty: number): n
   return top * (1 - ay) + bottom * ay;
 }
 
-/**
- * Контекст гладкой выборки Patch7: канонические высоты центральной ячейки и
- * 6 угловых слотов (`mapNeighborCellsToSlots`), визуальные границы
- * интерполяции и таблица реальной границы Вороного центральной ячейки по
- * азимуту. Строится один раз на участок: 65 536 точек сетки не должны
- * повторно вызывать `cellTangentMeters` (гейт G4 — генерация <= 150 мс).
- */
-interface SmoothPatchContext {
-  /** Каноническая высота центральной ячейки, м относительно seaLevel. */
-  readonly centerM: number;
-  /** Радиус, до которого вес центральной ячейки равен 1.0 (0.85 · radiusM), м. */
-  readonly coreRadiusM: number;
-  /**
-   * Бюджет локального рельефа (`LAND_FBM_AMPLITUDE_M` + `PROFILE_DETAIL_AMPLITUDE_M`
-   * при переданном профиле), м: им ограничен ВИЗУАЛЬНЫЙ вывод высоты к углам
-   * квадрата, чтобы инвариант И-3.2 (`anchor <= height <= anchor + бюджет`)
-   * держался на участках, целиком лежащих внутри одной канонической ячейки.
-   */
-  readonly reliefBudgetM: number;
-  /** Радиус полного доверия угловым слотам (√2 · radiusM — угол квадрата), м. */
-  readonly edgeRadiusM: number;
-  /**
-   * Расстояние до настоящей границы Вороного центральной ячейки по азимуту
-   * (720 отсчётов по 0.5°), м: половина расстояния до центра соседней ячейки,
-   * приведённая к лучу. Пустой массив — вырожденный патч без соседей.
-   */
-  readonly voronoiBoundaryM: Float64Array;
-  /**
-   * Каноническая высота угловых слотов Patch7 по азимуту (те же 720 отсчётов),
-   * м: сектора НАСТОЯЩЕЙ диаграммы Вороного с асимметричными smoothstep-
-   * переходами через их границы (см. `buildSlotHeightTable`).
-   */
-  readonly slotHeightM: Float64Array;
-  /** Канонические высоты всех 7 ячеек Patch7, м относительно seaLevel. */
-  readonly cellHeightsM: readonly number[];
-  /** Координаты центров тех же ячеек в касательной плоскости, м. */
-  readonly cellU: readonly number[];
-  readonly cellV: readonly number[];
-  /** Радиус «плато» ячейки (вписанная окружность Вороного), м. */
-  readonly plateauRadiusM: number;
-  /** Естественный предел макро-уклона между ячейками, м/м. */
-  readonly slopeLimit: number;
-}
-
-/** Отсчётов таблицы границы Вороного по азимуту (шаг 0.5°). */
-const VORONOI_ANGLE_STEPS = 720;
-
-/**
- * Stage-8.5: подготовка гладкой интерполяции Patch7 для участка `radiusM`.
- *
- * Ядро активного гекса (`LOCAL_HEX_CORE_RADIUS_RATIO · radiusM`) держит вес
- * центральной ячейки 1.0, а к углам квадрата `[-radiusM, +radiusM]` высота
- * плавно выводится к угловым слотам. Если участок крупнее реального шага
- * ячеек планеты (масштабы 625…1250 км, где `radiusM` переходит границу
- * Вороного центральной ячейки), радиусы интерполяции привязываются к этой
- * настоящей границе по азимуту: макро-склон между ячейками проходится плавно
- * ДО границы, а не скачком на ней, и рельеф остаётся честным продолжением
- * географии планеты, а не одной ячейкой, растянутой на всю карту.
- */
-function buildSmoothPatchContext(
-  patch: LocalMapPatch,
-  radiusM: number,
-  reliefBudgetM: number,
-): SmoothPatchContext {
-  const neighborSlots = mapNeighborCellsToSlots(patch);
-  const canonM = (cell: PatchCell): number => (
-    (isWaterCell(cell, patch.seaLevel)
-      ? waterLevelOf(cell, patch.seaLevel)
-      : baseElevationOf(cell)) - patch.seaLevel
-  ) * METERS_PER_ELEVATION_UNIT;
-  const center = patch.cells[0] as PatchCell;
-  const slotAngles: number[] = [];
-  const slotHalfDistancesM: number[] = [];
-  for (const slotCell of neighborSlots) {
-    const tangent = cellTangentMeters(patch, slotCell);
-    const distance = Math.hypot(tangent.u, tangent.v);
-    slotAngles.push(Math.atan2(tangent.v, tangent.u));
-    slotHalfDistancesM.push(distance * 0.5);
-  }
-  // Все 7 ячеек Patch7 в касательной плоскости: по ним строится непрерывное
-  // поле «максимума конусов» (см. smoothPatchPlanetField).
-  const cellHeightsM: number[] = [];
-  const cellU: number[] = [];
-  const cellV: number[] = [];
-  for (const cell of patch.cells) {
-    const tangent = cellTangentMeters(patch, cell);
-    cellHeightsM.push(canonM(cell));
-    cellU.push(tangent.u);
-    cellV.push(tangent.v);
-  }
-  const spacingM = slotHalfDistancesM.reduce((sum, half) => sum + half, 0)
-    / Math.max(1, slotHalfDistancesM.length) * 2;
-  const reliefM = Math.max(...cellHeightsM) - Math.min(...cellHeightsM);
-  const context = {
-    centerM: canonM(center),
-    reliefBudgetM,
-    coreRadiusM: LOCAL_HEX_CORE_RADIUS_RATIO * radiusM,
-    edgeRadiusM: Math.SQRT2 * radiusM,
-    voronoiBoundaryM: new Float64Array(0),
-    slotHeightM: new Float64Array(0),
-    cellHeightsM,
-    cellU,
-    cellV,
-    // Вписанная окружность ячейки Голдберга: половина шага центров соседей.
-    plateauRadiusM: spacingM * 0.5,
-    // Реальный перепад высот патча, приведённый к шагу ячеек, — уклон макро-склона.
-    slopeLimit: Math.max(1e-6, reliefM / Math.max(1, spacingM)),
-  };
-  const validSlots = slotHalfDistancesM.filter((distance) => distance > 0.5);
-  if (validSlots.length === 0) return context;
-  // Граница Вороного центральной ячейки вдоль луча φ — минимум по соседям
-  // `(d_k / 2) / cos(φ − φ_k)`: пересечение перпендикулярных биссектрис
-  // отрезков до центров соседних ячеек Patch7.
-  const fallbackM = Math.max(...slotHalfDistancesM) * 4;
-  const boundaryTable = new Float64Array(VORONOI_ANGLE_STEPS);
-  for (let i = 0; i < VORONOI_ANGLE_STEPS; i++) {
-    const phi = (i / VORONOI_ANGLE_STEPS) * Math.PI * 2;
-    let boundaryM = fallbackM;
-    for (let k = 0; k < slotAngles.length; k++) {
-      const half = slotHalfDistancesM[k] as number;
-      if (!(half > 0.5)) continue;
-      const facing = Math.cos(phi - (slotAngles[k] as number));
-      if (facing > 1e-6) boundaryM = Math.min(boundaryM, half / facing);
-    }
-    boundaryTable[i] = boundaryM;
-  }
-  // Высота угловых слотов по азимуту: сектора настоящей диаграммы Вороного
-  // Patch7 на характерном радиусе (среднее расстояние до угловых слотов).
-  const referenceRadiusM = (slotHalfDistancesM.reduce((sum, half) => sum + half, 0)
-    / slotHalfDistancesM.length) * 2;
-  const heightTable = buildSlotHeightTable(patch, canonM, context.centerM, referenceRadiusM);
-  return { ...context, voronoiBoundaryM: boundaryTable, slotHeightM: heightTable };
-}
-
-/**
- * Stage-8.5: каноническая высота Patch7 по азимуту (720 отсчётов по 0.5°).
- *
- * Секторы берутся из НАСТОЯЩЕЙ диаграммы Вороного: на характерном радиусе для
- * каждого азимута определяется ближайшая каноническая ячейка Patch7. Переход
- * через границу двух соседей асимметричен, как и радиальный вывод высоты:
- * подъём к более высокой ячейке завершается ровно на границе, а спуск к более
- * низкой начинается на ней и продолжается уже внутри её сектора. Поэтому
- * жёсткий пол И-3.2 («суша не ниже канонической высоты своей ячейки») не
- * порождает ступеньку ни на одной границе: вместо прямого ребра Вороного
- * получается непрерывный склон реальной географии планеты.
- */
-function buildSlotHeightTable(
-  patch: LocalMapPatch,
-  canonM: (cell: PatchCell) => number,
-  centerM: number,
-  referenceRadiusM: number,
-): Float64Array {
-  const steps = VORONOI_ANGLE_STEPS;
-  const table = new Float64Array(steps).fill(centerM);
-  const cells = patch.cells;
-  if (cells.length < 2 || !(referenceRadiusM > 1)) return table;
-
-  // 1. Владелец сектора — ближайшая каноническая ячейка на характерном радиусе.
-  const ownerHeightM = new Float64Array(steps);
-  const owners = new Int32Array(steps);
-  for (let i = 0; i < steps; i++) {
-    const phi = (i / steps) * Math.PI * 2;
-    const cell = nearestPatchCell(
-      patch,
-      localPointToDirection(patch, referenceRadiusM * Math.cos(phi), referenceRadiusM * Math.sin(phi)),
-    );
-    const index = cells.indexOf(cell);
-    const owner = index >= 0 ? index : 0;
-    owners[i] = owner;
-    ownerHeightM[i] = canonM(cells[owner] as PatchCell);
-    table[i] = ownerHeightM[i] as number;
-  }
-
-  // 2. Границы секторов (азимуты, на которых меняется ближайшая ячейка).
-  const boundaries: number[] = [];
-  for (let i = 0; i < steps; i++) {
-    if (owners[i] !== owners[(i + 1) % steps]) boundaries.push((i + 1) % steps);
-  }
-  if (boundaries.length === 0) return table;
-
-  // 3. Асимметричные переходы: подъём — во второй половине предыдущего сектора,
-  //    спуск — в первой половине нового (окна не пересекаются).
-  for (let b = 0; b < boundaries.length; b++) {
-    const start = boundaries[b] as number;
-    const end = boundaries[(b + 1) % boundaries.length] as number;
-    const prevStart = boundaries[(b - 1 + boundaries.length) % boundaries.length] as number;
-    const width = ((end - start + steps) % steps) || steps;
-    const prevWidth = ((start - prevStart + steps) % steps) || steps;
-    const hNext = ownerHeightM[start] as number;
-    const hPrev = ownerHeightM[(start - 1 + steps) % steps] as number;
-    const delta = hNext - hPrev;
-    if (Math.abs(delta) < 1e-9) continue;
-    if (delta > 0) {
-      const w = Math.max(1, Math.floor(prevWidth / 2));
-      for (let k = 0; k < w; k++) {
-        table[(start - 1 - k + steps * 2) % steps] = hPrev + delta * smooth01((w - k) / w);
-      }
-    } else {
-      const w = Math.max(1, Math.floor(width / 2));
-      for (let k = 0; k < w; k++) {
-        table[(start + k) % steps] = hPrev + delta * smooth01(k / w);
-      }
-    }
-  }
-  return table;
-}
-
-/** Выборка циклической таблицы по азимуту (720 отсчётов, линейно между ними). */
-function sampleAngleTable(table: Float64Array, phi: number): number {
-  if (table.length !== VORONOI_ANGLE_STEPS) return 0;
-  const pos = (phi / (Math.PI * 2)) * VORONOI_ANGLE_STEPS;
-  const i0 = Math.floor(pos) % VORONOI_ANGLE_STEPS;
-  const i1 = (i0 + 1) % VORONOI_ANGLE_STEPS;
-  const v0 = table[i0] as number;
-  const v1 = table[i1] as number;
-  return v0 + (v1 - v0) * (pos - Math.floor(pos));
-}
-
-/**
- * Stage-8.5: визуальный вывод высоты от центральной ячейки к угловым слотам
- * Patch7, м относительно seaLevel. Внутри ядра активного гекса
- * (`LOCAL_HEX_CORE_RADIUS_RATIO · radiusM`) вес центральной ячейки равен 1.0,
- * а к углам квадрата `[-radiusM, +radiusM]` высота плавно интерполируется к
- * угловым слотам `mapNeighborCellsToSlots(patch)`: прямые диагональные рёбра
- * Вороного, которые давал ступенчатый `nearestPatchCell`, исчезают.
- */
-function smoothPatchSample(context: SmoothPatchContext, x: number, y: number): number {
-  const r = Math.hypot(x, y);
-  if (!(r > 0)) return context.centerM;
-  const hasTables = context.voronoiBoundaryM.length === VORONOI_ANGLE_STEPS
-    && context.slotHeightM.length === VORONOI_ANGLE_STEPS;
-  const phi = (Math.atan2(y, x) + Math.PI * 2) % (Math.PI * 2);
-  // Высота углового слота по азимуту и настоящая граница Вороного по тому же лучу.
-  const slotHeightM = hasTables ? sampleAngleTable(context.slotHeightM, phi) : context.centerM;
-  const deltaM = slotHeightM - context.centerM;
-  // Радиусы интерполяции: визуальное ядро/угол квадрата, но привязанные к
-  // реальной границе Вороного. Подъём завершается на границе, спук начинается
-  // на ней — так ступенька `nearestPatchCell` не возникает ни с одной стороны.
-  let coreM = context.coreRadiusM;
-  let edgeM = context.edgeRadiusM;
-  if (hasTables) {
-    const boundaryM = sampleAngleTable(context.voronoiBoundaryM, phi);
-    if (deltaM >= 0) {
-      coreM = Math.min(coreM, boundaryM * LOCAL_PATCH_RAMP_START_RATIO);
-      edgeM = Math.max(Math.min(edgeM, boundaryM * LOCAL_PATCH_RAMP_END_RATIO), coreM + 1e-3);
-    } else {
-      coreM = boundaryM * LOCAL_PATCH_FALL_START_RATIO;
-      edgeM = Math.max(boundaryM * LOCAL_PATCH_FALL_END_RATIO, coreM + 1e-3);
-    }
-  }
-  if (!(r > coreM)) return context.centerM;
-  const t = smooth01((r - coreM) / (edgeM - coreM));
-  // Подъём к угловому слоту ограничен бюджетом локального рельефа: на участке,
-  // который целиком лежит внутри одной канонической ячейки, инвариант И-3.2
-  // требует `height <= anchor + бюджет`. Спуск бюджетом не ограничен — он и так
-  // начинается только за настоящей границей Вороного.
-  const cappedDeltaM = deltaM > context.reliefBudgetM ? context.reliefBudgetM : deltaM;
-  return context.centerM + cappedDeltaM * t;
-}
-
-/**
- * Stage-8.5: непрерывное поле канонических высот Patch7 — «максимум конусов».
- *
- * Каждая ячейка держит своё каноническое плато внутри вписанной окружности
- * Вороного, а за её пределами высота уходит вниз конусом с естественным
- * уклоном `slopeLimit` (реальный перепад высот патча, делённый на шаг ячеек).
- * Максимум по всем 7 ячейкам непрерывен всюду и НИКОГДА не ниже канонической
- * высоты ближайшей ячейки, поэтому жёсткий пол И-3.2 не создаёт ступенек на
- * границах Вороного — в том числе между двумя соседями, где радиально-угловая
- * схема не работает (граница соседей не является лучом из центра участка).
- */
-function smoothPatchPlanetField(context: SmoothPatchContext, x: number, y: number): number {
-  const cells = context.cellHeightsM.length;
-  if (cells === 0) return context.centerM;
-  let best = -Infinity;
-  for (let k = 0; k < cells; k++) {
-    const du = x - (context.cellU[k] as number);
-    const dv = y - (context.cellV[k] as number);
-    const excess = Math.sqrt(du * du + dv * dv) - context.plateauRadiusM;
-    const value = (context.cellHeightsM[k] as number)
-      - (excess > 0 ? context.slopeLimit * excess : 0);
-    if (value > best) best = value;
-  }
-  return Number.isFinite(best) ? best : context.centerM;
-}
-
 export function smooth01(t: number): number {
   const x = t < 0 ? 0 : t > 1 ? 1 : t;
   return x * x * (3 - 2 * x);
@@ -814,11 +480,9 @@ export interface BaseHeightfield {
 }
 
 /**
- * Stage-8.12d (A-31): единое полосно-ограниченное зерно сухопутного рельефа для
- * центрального участка, воротника и юбки горизонта. Октавы ограничены полосой,
- * разрешимой и сеткой heightfield (256×256), и полярным воротником (144×36):
- * перепад соседних вершин суши остаётся <= 6 м, а на шестиугольном срезе нет
- * смены зерна или бюджета амплитуд.
+ * Исторический диагностический сэмплер зерна A-31: не участвует в вычислении
+ * W23 heightfield/юбки, но оставлен для совместимости экспорта и теста
+ * полосного ограничения амплитуды в tests/local-map-texture-812d.test.mjs.
  */
 export function sampleLandGrainT(
   ux: number,
@@ -826,100 +490,94 @@ export function sampleLandGrainT(
   seed: number,
   detailSigned: number | null,
 ): number {
-  const fbmT = fBm(ux, uy, seed, 4, 2.0, 0.45);
+  // Амплитуда ×3 не должна утроить скачок между соседями: старая ветвь
+  // запасного горизонта уменьшает частоту зерна, сохраняя его диапазон.
+  const fbmT = fBm(ux * 0.40, uy * 0.40, seed, 4, 2.0, 0.45);
   if (detailSigned === null) return fbmT;
   const detail01 = detailSigned * 0.5 + 0.5;
-  const ridgeT = ridgedFbm(ux * 0.55, uy * 0.55, seed ^ 0x2F5A11, 3);
+  const ridgeT = ridgedFbm(ux * 0.22, uy * 0.22, seed ^ 0x2F5A11, 3);
   return clampScalar(0.52 * fbmT + 0.30 * detail01 + 0.18 * ridgeT, 0, 1);
 }
 
 /**
- * Stage-8.12d: базовый рельеф участка БЕЗ русел. Формулы те же, что были в
- * первом проходе generateLocalMap: якорь Patch7 (И-3.2), гладкая интерполяция
- * (Stage-8.5), fBm и канал `detail` (И-3.1), батиметрия океана из канала
- * `elevation` с edgeBlend воротника (A-29). Врез русла — applyRiverCarve
- * (local-map-rivers.ts), второй проход по этому результату.
+ * Сэмпл одной физической точки планеты: никаких поправок относительно центра
+ * активного гекса или канонического якоря Patch7. Две проекции той же `dir`
+ * с тем же шагом и общим seed различаются только округлением координат
+ * exp-карты (контроль W23: < 10⁻⁹ м). `stepM` —
+ * фактический шаг исходной сетки (а НЕ шаг решётки для интерполяции).
  *
- * `spawnMask` мутирует здесь: вода и тексели со streamWeight > 0 получают 0
- * (И-3.4); точки стрежня, которые врез пометит позже, тоже получат 0 вторым проходом.
+ * Два канала малой детали заданы в *мировых* координатах единичной сферы,
+ * умноженных на радиус планеты, а не в локальной касательной плоскости/seed
+ * ячейки. Поэтому и суша, и океан имеют одинаковый механизм микрорельефа.
+ */
+export function sampleLocalTerrainHeightM(
+  dir: Vec3,
+  stepM: number,
+  planetRadiusM: number,
+  seed: number,
+  withDetail: boolean,
+): number {
+  const elevationM = sampleElevation(dir, stepM);
+  // Две линейно независимые оси в 3D дают непрерывный общий адрес шума по
+  // всей сфере (нет меридианного шва долгот/полюсного скачка). Период первой
+  // октавы фиксирован в МЕТРАХ, не в долях R_patch или в шагах LOD.
+  const scale = planetRadiusM / 5200;
+  const ux = scale * (dir[0] * 0.80 - dir[1] * 0.60);
+  const uy = scale * (dir[1] * 0.60 + dir[2] * 0.80);
+  const macro = fBm(ux, uy, seed, 3);
+  const detail = withDetail
+    ? valueNoise2D(ux * 1.8 + 13.7, uy * 1.8 - 7.9, seed ^ 0x2F5A11)
+    : 0.5;
+  return elevationM + (macro * 2 - 1) * LAND_FBM_AMPLITUDE_M
+    + (detail * 2 - 1) * (withDetail ? PROFILE_DETAIL_AMPLITUDE_M : 0);
+}
+
+/**
+ * Поле вершин без вреза рек. Для КАЖДОЙ вершины вычисляется направление
+ * exp-карты патча и sampleElevation(dir, 2·R/hfRes). Классификация Patch7
+ * влияет только на маски; озеро держит своё каноническое зеркало. Ни берег,
+ * ни батиметрия океана НЕ клампятся к константе -0,035 или к высоте центра.
  */
 export function buildBaseHeightfield(
   patch: LocalMapPatch,
   radiusM: number,
-  cellSeed: number,
+  planetSeed: number,
   spawnMask: Uint8Array,
-  detailLattice: LocalFieldLattice | null,
+  withDetail: boolean,
 ): BaseHeightfield {
   const hfRes = HEIGHTFIELD_RES;
-  const cellSize = (2 * radiusM) / hfRes;
-  const noiseScale = (3.5 + Math.log2(Math.max(1, radiusM / 600)) * 0.65) / Math.max(radiusM, 1);
-  // Stage-8.5: бюджет локального рельефа: без профиля — только fBm
-  // (LAND_FBM_AMPLITUDE_M), с профилем (И-3.1) — плюс амплитуда канала `detail`.
-  const landBudgetM = LAND_FBM_AMPLITUDE_M + (detailLattice ? PROFILE_DETAIL_AMPLITUDE_M : 0);
-  const smoothContext = buildSmoothPatchContext(patch, radiusM, landBudgetM);
-  const localCenterCell = patch.cells[0] as PatchCell;
-  const centerApothemM = CENTER_HEX_RADIUS_RATIO * HEX_APOTHEM_RATIO * radiusM;
+  const stepM = (2 * radiusM) / hfRes;
   const heightM = new Float64Array(hfRes * hfRes);
   const landMask = new Uint8Array(hfRes * hfRes);
-  // Stage-8.5: `terraform_map` несёт явный водный маркер (байт 0 на воде).
   const terraformMap = generateTerraformMap();
   let waterPoints = 0;
 
   for (let y = 0; y < hfRes; y++) {
     for (let x = 0; x < hfRes; x++) {
       const idx = y * hfRes + x;
-      const wx = (x - hfRes / 2) * cellSize;
-      const wy = (y - hfRes / 2) * cellSize;
+      const wx = (x - hfRes / 2) * stepM;
+      const wy = (y - hfRes / 2) * stepM;
+      const dir = localPointToDirection(patch, wx, wy);
+      const cell = nearestPatchCell(patch, dir);
+      const isWater = isWaterCell(cell, patch.seaLevel);
+      if (isWater || cell.streamWeight > 0) spawnMask[idx] = 0;
 
-      // И-3.1: (u, v) → 3D-направление → ближайшая каноническая ячейка Patch7.
-      const cell = nearestPatchCell(patch, localPointToDirection(patch, wx, wy));
-      // И-3.2/И-3.4: локальная точка воды/озера/русла гасит спавн независимо от маски.
-      if (isWaterCell(cell, patch.seaLevel) || cell.streamWeight > 0) spawnMask[idx] = 0;
-
-      let height: number;
-      if (isWaterCell(cell, patch.seaLevel)) {
+      if (isWater) {
         waterPoints++;
-        if (cell.lakeWeight > 0) {
-          // И-3.2: континентальное озеро остаётся на положительном зеркале.
-          height = (waterLevelOf(cell, patch.seaLevel) - patch.seaLevel) * METERS_PER_ELEVATION_UNIT;
-        } else {
-          // A-29: океан несёт батиметрию того же канала elevation, который
-          // строит юбку. Минимум 0.035 единицы совпадает с signedCanon.
-          // У грани микрополе плавно приходит к канонической высоте ячейки.
-          const rawElevation = detailLattice
-            ? sampleDetailAt(detailLattice.elevation, x / hfRes, y / hfRes)
-            : cell.elevation;
-          const rawBathymetryM = (
-            Math.min(rawElevation, patch.seaLevel - 0.035) - patch.seaLevel
-          ) * METERS_PER_ELEVATION_UNIT;
-          const canonicalBathymetryM = (
-            Math.min(localCenterCell.elevation, patch.seaLevel - 0.035) - patch.seaLevel
-          ) * METERS_PER_ELEVATION_UNIT;
-          const edgeBlend = smooth01(
-            (clusterHexMetric(wx, wy) - centerApothemM * 0.72) / (centerApothemM * 0.18),
-          );
-          height = rawBathymetryM + (canonicalBathymetryM - rawBathymetryM) * edgeBlend;
-        }
-        // Stage-8.5: явный водный маркер — байт 0 в `terraform_map`.
         terraformMap[idx] = 0;
       } else {
         landMask[idx] = 1;
-        // И-3.2: суша надёжно выше канонической высоты ячейки (берег не «ныряет»).
-        const anchor = (baseElevationOf(cell) - patch.seaLevel) * METERS_PER_ELEVATION_UNIT;
-        // Stage-8.5: базовая высота суши — гладкая интерполяция Patch7.
-        const planetM = smoothPatchPlanetField(smoothContext, wx, wy);
-        const sampleM = smoothPatchSample(smoothContext, wx, wy);
-        const baseM = Math.max(anchor, planetM, sampleM);
-        const tiltM = clampScalar(sampleM - planetM, 0, landBudgetM);
-        // Stage-8.5 / Stage-8.12d (A-31): долину лепит единое с воротником
-        // и юбкой полосно-ограниченное зерно sampleLandGrainT.
-        const detailSigned = detailLattice
-          ? sampleDetailAt(detailLattice.detail, x / hfRes, y / hfRes)
-          : null;
-        const reliefT = sampleLandGrainT(wx * noiseScale, wy * noiseScale, cellSeed, detailSigned);
-        height = baseM + (landBudgetM - tiltM) * reliefT;
       }
-      heightM[idx] = height;
+      // Озёрное зеркало — отдельный гидрологический контракт. Морское дно и
+      // суша используют один и тот же физический сэмпл, включая общий шум.
+      // Даже под озером sampleElevation вызывается на вершине (одинаковая
+      // полоса частот на всех ветвях), но зеркало остаётся на filledElevation.
+      const naturalM = sampleLocalTerrainHeightM(
+        dir, stepM, patch.frame.radiusM, planetSeed, withDetail,
+      );
+      heightM[idx] = cell.lakeWeight > 0
+        ? (waterLevelOf(cell, patch.seaLevel) - patch.seaLevel) * METERS_PER_ELEVATION_UNIT
+        : naturalM;
     }
   }
   return { heightM, landMask, terraformMap, waterPoints };

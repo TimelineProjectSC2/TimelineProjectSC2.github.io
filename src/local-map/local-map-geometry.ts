@@ -1,17 +1,13 @@
-/* LocalMapGeometry — чистые геометрические хелперы локальной карты
-   (Stage-8.10b, A-12b).
-   --------------------------------------------------------------------------
-   Вынесены из src/local-map/local-map-worker.ts, чтобы главный поток
-   страницы мог статически импортировать каркас локальной сцены (слоты
-   соседних ячеек, кривизна горизонта) БЕЗ таскания модуля генерации —
-   а через него полного Wasm-ядра planet-core. Модуль не имеет значения-
-   ных импортов: ни ядра, ни контракта (только типы wire-протокола).
+/* LocalMapGeometry — чистые геометрические хелперы локальной карты (W23).
+   Главный поток импортирует каркас сцены без Wasm-ядра: только типы
+   wire-протокола, никаких значимых импортов. Точная обратная exp-проекция
+   позволяет сравнить одно физическое направление в двух кадрах; апофема
+   задана тем же геометрическим шагом, что и шесть соседних центров. */
 
-   Публичный API и формулы сохранены дословно (побитовая эквивалентность
-   generateLocalMap / generateHorizonSkirt проверяется golden-тестом в
-   tests/local-map-stage8.test.mjs). */
+import type { LocalMapPatch, PatchCell, Vec3 } from './local-map-contract.ts';
 
-import type { LocalMapPatch, PatchCell } from './local-map-contract.ts';
+/** Апофема правильного гекса в долях R_patch: половина шага центров 1,15 R. */
+export const CENTER_HEX_APOTHEM_RATIO = 1.15 / 2;
 
 /** Число угловых слотов кольца юбки: 6 направлений θ_k = k·π/3. */
 export const SKIRT_RING_COUNT = 6;
@@ -71,6 +67,19 @@ export function mapNeighborCellsToSlots(patch: LocalMapPatch): readonly PatchCel
 export function planetCurvatureDropM(planetRadiusM: number, rM: number): number {
   if (!(planetRadiusM > 1)) return 0;
   return planetRadiusM - Math.sqrt(Math.max(0, planetRadiusM * planetRadiusM - rM * rM));
+}
+
+/**
+ * Обратная к localPointToDirection exp-карта. Применяется для сравнения
+ * ОДНОЙ физической точки в касательных кадрах двух разных патчей (m.13).
+ */
+export function directionToLocalPoint(patch: LocalMapPatch, dir: Vec3): { u: number; v: number } {
+  const { origin, east, north, radiusM } = patch.frame;
+  const dot = (a: Vec3, b: Vec3): number => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const theta = Math.acos(Math.max(-1, Math.min(1, dot(origin, dir))));
+  const sin = Math.sin(theta);
+  const scale = sin > 1e-10 ? theta * radiusM / sin : radiusM;
+  return { u: dot(dir, east) * scale, v: dot(dir, north) * scale };
 }
 
 /** Ландшафт назначения для подписи перехода на соседний гекс (A-17). */

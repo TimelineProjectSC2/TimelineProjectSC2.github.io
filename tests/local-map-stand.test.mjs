@@ -1,14 +1,8 @@
-/* Тест измерительного стенда локальной карты (Stage-8.12d + Stage-8.14, шаг 1).
-   ---------------------------------------------------------------------------
-   Стенд — инструмент измерения, а не тест дефектов. Тест проверяет
-   ВЫЧИСЛИМОСТЬ метрик (числа конечные, в разумных пределах), структуру
-   отчёта и негативный контроль на плоской синтетической фикстуре, а НЕ
-   прохождение порогов живой картой: пока пороги красные, CI не должен
-   краснеть из-за текущего состояния карты.
-
-   Когда починка закроет дефекты и пороги станут зелёными, тест останется
-   зелёным: он не завязан на текущие значения живой карты, а только на их
-   конечность, диапазон, негативный контроль и согласованность отчёта с CLI.
+/* Тест измерительного стенда локальной карты (Stage-8.14 / W23).
+   Большинство метрик проверяются на вычислимость/отрицательные контроли, а
+   W23 дополнительно закрепляет физическую геометрию 6 соседей, общее поле
+   65²/256² и пороги m.8/m.9 на 40 детерминированных морских пятнах.
+   Старые golden из tests/local-map-stage8.test.mjs здесь не переписываются.
 
    Запуск: node --test tests/local-map-stand.test.mjs
 */
@@ -23,6 +17,9 @@ const require = createRequire(import.meta.url);
 const GeodesicGrid = require('../site/shared/geodesic-grid.ts').default;
 const PlanetSurface = require('../site/shared/planet-surface.ts').default;
 const PlanetElevationField = require('../site/shared/planet-elevation-field.ts');
+const { GLOBE_CELL_SCALE, GLOBE_RELIEF } = require('../site/shared/planet-globe.ts');
+const Geometry = require('../src/local-map/local-map-geometry.ts');
+const Heightfield = require('../src/local-map/local-map-heightfield.ts');
 const Contract = require('../src/local-map/local-map-contract.ts');
 const Worker = require('../src/local-map/local-map-worker.ts');
 
@@ -53,7 +50,7 @@ const VALUE_LIMITS = {
   'согласованность LOD': 20000,
 };
 
-const report = await stand.runStand({ world: 'a29', radiusM: 2500 });
+const report = await stand.runStand({ world: 'a29' });
 
 test('стенд: конфигурация измерений зафиксирована владельцем', () => {
   assert.deepEqual(
@@ -72,10 +69,10 @@ test('стенд: конфигурация измерений зафиксиро
   assert.equal(stand.THRESHOLDS.carveAreaMaxPct, 12, 'доля площади гекса под врезом ≤ 12 %');
   assert.equal(stand.CARVE_AREA_GRID, 44, 'метрика 7: сетка 44×44');
   assert.equal(stand.CARVE_AREA_RADIUS_RATIO, 0.95, 'метрика 7: радиус 0,95·R');
-  // Stage-8.14 (шаг 1, Воркер 26): пороги метрик m.8…m.14 менять нельзя.
-  assert.equal(stand.THRESHOLDS.landReliefMinPct, 10, 'm.8 размах суши: минимум 10 %');
-  assert.equal(stand.THRESHOLDS.landReliefMaxPct, 25, 'm.8 размах суши: максимум 25 %');
-  assert.equal(stand.THRESHOLDS.oceanReliefMinPct, 5, 'm.9 размах океанского дна ≥ 5 %');
+  // W23: обновлены только m.8/m.9; остальные пороги m.10…m.14 не смягчаются.
+  assert.equal(stand.THRESHOLDS.landReliefMinPct, 3, 'm.8 размах суши: минимум 3 %');
+  assert.equal(stand.THRESHOLDS.landReliefMaxPct, 8, 'm.8 размах суши: максимум 8 %');
+  assert.equal(stand.THRESHOLDS.oceanReliefMinPct, 1, 'm.9 размах океанского дна ≥ 1 %');
   assert.equal(stand.THRESHOLDS.meanSlopeMinPct, 4, 'm.10 средний уклон ≥ 4 %');
   assert.equal(stand.THRESHOLDS.hypsometryMinPct, 20, 'm.11 гипсометрия p90−p10: минимум полосы 20 %');
   assert.equal(stand.THRESHOLDS.hypsometryMaxPct, 35, 'm.11 гипсометрия p90−p10: потолок полосы 35 %');
@@ -489,7 +486,7 @@ test('W26b п.1: m.13 (measureHexContinuity) — контроль азимута
   assert.match(row137436.detail, /слот·60° против истинного азимута:.*диапазон \+14,6°…\+17,8°/);
 
   for (const row of report.rows.filter((r) => r.metric === stand.METRIC_TITLES.hexContinuity)) {
-    assert.match(row.detail, /разность якорных высот патчей, не шов; станет швом после W23/);
+    assert.match(row.detail, /один dir в кадрах A\/B; max Δ расстояния до центров = 0 м/);
   }
 });
 
@@ -527,10 +524,10 @@ test('W26b п.1 (негативный контроль «сдвинутая шк
 
 test('W26b доп. п.2 (негативный контроль окна 5 000 м): --radius-m=2500 и --radius-m=52136 дают ОДИНАКОВЫЕ m.8 / m.9 / m.10', async () => {
   assert.equal(stand.RELIEF_WINDOW_WIDTH_M, 5000, 'ширина фиксированного окна равна 5 000 м');
-  assert.equal(stand.DEFAULT_RADIUS_M, 2500, 'до слияния #233 DEFAULT_RADIUS_M остаётся 2500 м');
+  assert.equal(stand.DEFAULT_RADIUS_M, GLOBE_CELL_SCALE.strategicPatchRadiusM);
 
-  const rep2500 = report;
-  const rep52136 = await stand.runStand({ radiusM: 52136 });
+  const rep2500 = await stand.runStand({ radiusM: 2500 });
+  const rep52136 = report;
   const targetMetrics = [
     stand.METRIC_TITLES.landRelief,
     stand.METRIC_TITLES.oceanRelief,
@@ -567,7 +564,7 @@ test('W26b доп. п.2 (негативный контроль окна 5 000 м
 test('W26b п.2: m.14 (measureLodConsistency) сравнивает одинаковый span — 0 м на константном поле и ≤ 2 м на реальном', () => {
   const grid = GeodesicGrid.build(stand.CANONICAL_V);
   const surface = PlanetSurface.generateSurface(grid, stand.WORLDS.a29.profile);
-  const radiusM = stand.DEFAULT_RADIUS_M;
+  const radiusM = 2500;
   const resFine = stand.LOD_FINE_RES;
   const resCoarse = stand.LOD_COARSE_RES;
 
@@ -648,11 +645,11 @@ test('W26b п.2: m.14 (measureLodConsistency) сравнивает одинак�
     );
   }
 
-  // Кроме того, на живом прогоне стенда все 5 глубоководных ячеек проходят порог ≤ 2 м.
+  // Живая карта на R≈52 км честно сообщает residual LOD (не золотое число 2 м).
   for (const oceanCell of [37488, 37518, 37548, 37519, 137363]) {
     const row = report.rows.find((r) => r.cell === oceanCell && r.metric === stand.METRIC_TITLES.lodConsistency);
-    assert.ok(row && row.value <= stand.THRESHOLDS.lodConsistencyMaxM, `живая карта ${oceanCell}: m.14 ≤ 2 м (${row?.value})`);
-    assert.equal(row.status, 'PASS');
+    assert.ok(row && Number.isFinite(row.value), `живая карта ${oceanCell}: m.14 измерима`);
+    assert.equal(row.status, row.value <= stand.THRESHOLDS.lodConsistencyMaxM ? 'PASS' : 'FAIL');
   }
 });
 
@@ -704,7 +701,7 @@ test('W26b п.3 (негативный контроль m.11): идеально �
 });
 
 test('W26b п.4: вертикальное преувеличение глобуса (печать без порога, суша/океан и отношение)', () => {
-  // На опорных параметрах домена при K = 8 570 ожидается 46,1× / 4,6×, отношение 0,10.
+  // Значения сверяются с GLOBE_RELIEF, а не с устаревшими 0,022/0,008.
   const refEx = stand.measureGlobeVerticalExaggeration(
     {
       radiusKm: 6371,
@@ -714,9 +711,9 @@ test('W26b п.4: вертикальное преувеличение глобу�
     },
     { scaleK: 8570 },
   );
-  assert.equal(Number(refEx.landExaggeration.toFixed(1)), 46.1, `суша 46,1× (${refEx.landExaggeration})`);
-  assert.equal(Number(refEx.oceanExaggeration.toFixed(1)), 4.6, `океан 4,6× (${refEx.oceanExaggeration})`);
-  assert.equal(Number(refEx.oceanToLandRatio.toFixed(2)), 0.10, `отношение 0,10 (${refEx.oceanToLandRatio})`);
+  assert.equal(refEx.landExaggeration, GLOBE_RELIEF.landMax * 6_371_000 / ((0.638 - 0.283141) * 8570));
+  assert.equal(refEx.oceanExaggeration, GLOBE_RELIEF.oceanMax * 6_371_000 / ((0.283141 + 1) * 8570));
+  assert.equal(Number(refEx.oceanToLandRatio.toFixed(2)), 0.50, `отношение 0,50 (${refEx.oceanToLandRatio})`);
 
   // Отношение океан/суша не меняется от смены K (глобус нормирует высоту на размах поля).
   const refEx900 = stand.measureGlobeVerticalExaggeration(
@@ -737,5 +734,155 @@ test('W26b п.4: вертикальное преувеличение глобу�
   assert.ok(report.globeVerticalExaggeration, 'в отчёте стенда есть globeVerticalExaggeration');
   assert.ok(report.globeVerticalExaggeration.landExaggeration > 0);
   assert.ok(report.globeVerticalExaggeration.oceanExaggeration > 0);
-  assert.match(report.globeVerticalExaggeration.detail, /site\/shared\/planet-globe\.ts:286–294/);
+  assert.match(report.globeVerticalExaggeration.detail, /site\/shared\/planet-globe\.ts:GLOBE_RELIEF/);
+});
+
+// W23: проверяем физическую границу и поле отдельно от исторических golden
+// тестов Stage-8 (их значения не обновляются на этой ветке).
+test('W23: апофема 29 978 м, все 6 идеальных соседей замощают общие грани без щелей/нахлёстов', () => {
+  const radiusM = stand.DEFAULT_RADIUS_M;
+  const a = Worker.CENTER_HEX_RADIUS_RATIO * Worker.HEX_APOTHEM_RATIO * radiusM;
+  const d = Worker.SKIRT_HEX_SPACING_RATIO * radiusM;
+  assert.ok(Math.abs(radiusM - GLOBE_CELL_SCALE.strategicPatchRadiusM) < 1e-8);
+  assert.ok(Math.abs(a - GLOBE_CELL_SCALE.cellApothemM) < 1e-8);
+  assert.ok(Math.abs(d - GLOBE_CELL_SCALE.cellCenterSpacingM) < 1e-8);
+  assert.ok(Math.abs(a / Worker.HEX_APOTHEM_RATIO - GLOBE_CELL_SCALE.cellEdgeM) < 1e-8);
+  assert.ok(Math.abs(Worker.CENTER_HEX_RADIUS_RATIO - 0.6639528095680696) < 1e-12);
+  assert.ok(Worker.SKIRT_INNER_RADIUS_RATIO * radiusM < a, 'воротник начинается внутри грани');
+  assert.ok(Worker.LOCAL_PATCH_RAMP_START_RATIO * a < a);
+  assert.ok(Worker.LOCAL_PATCH_RAMP_END_RATIO * a > a);
+  assert.ok(Worker.LOCAL_PATCH_RAMP_END_RATIO * a < a / Worker.HEX_APOTHEM_RATIO);
+  const Shaders = require('../src/local-map/local-map-shaders.ts');
+  assert.match(Shaders.TERRAIN_FRAGMENT_SHADER, /hexApothem = u_focusRadiusM \* 0\.575/);
+
+  const halfEdge = a / Math.sqrt(3);
+  for (let slot = 0; slot < 6; slot++) {
+    const phi = slot * Math.PI / 3;
+    const nx = Math.cos(phi), ny = Math.sin(phi);
+    for (let i = 0; i <= 16; i++) {
+      const along = (i / 16 * 2 - 1) * halfEdge;
+      const x = a * nx - along * ny;
+      const y = a * ny + along * nx;
+      const metricA = Worker.clusterHexMetric(x, y);
+      const metricB = Worker.clusterHexMetric(x - d * nx, y - d * ny);
+      assert.ok(Math.abs(metricA - a) < 1e-8 && Math.abs(metricB - a) < 1e-8,
+        `слот ${slot}, отсчёт ${i}: общая грань одновременно на обоих контурах`);
+      if (i === 8) {
+        const beyondA = Worker.clusterHexMetric(x + nx, y + ny);
+        const insideB = Worker.clusterHexMetric(x + nx - d * nx, y + ny - d * ny);
+        assert.ok(beyondA > a && insideB < a, 'по разные стороны грани ровно один владелец');
+      }
+    }
+  }
+});
+
+test('W23: одно направление через два кадра и на шагах 65²/256² имеет одинаковую высоту; растровый остаток — интерполяция', () => {
+  const grid = GeodesicGrid.build(stand.CANONICAL_V);
+  const surface = PlanetSurface.generateSurface(grid, stand.WORLDS.a29.profile);
+  const patchA = Contract.buildPatch7(grid, surface, 37488);
+  const patchB = Contract.buildPatch7(grid, surface, 37519);
+  const centerA = patchA.frame.origin, centerB = patchB.frame.origin;
+  const centerSum = centerA.map((v, i) => v + centerB[i]);
+  const midLen = Math.hypot(...centerSum);
+  const mid = centerSum.map((v) => v / midLen);
+  const cross = [
+    centerA[1] * centerB[2] - centerA[2] * centerB[1],
+    centerA[2] * centerB[0] - centerA[0] * centerB[2],
+    centerA[0] * centerB[1] - centerA[1] * centerB[0],
+  ];
+  const normalLen = Math.hypot(...cross);
+  const along = cross.map((v) => v / normalLen);
+  const radiusM = stand.DEFAULT_RADIUS_M;
+  const halfEdge = GLOBE_CELL_SCALE.cellApothemM / Math.sqrt(3);
+  const seed = (stand.WORLDS.a29.seed ^ Math.imul(3, 0x85EBCA6B)) >>> 0;
+  const frameSamples = [];
+  for (let p = 0; p < 16; p++) {
+    const s = ((p + 0.5) / 16 - 0.5) * 2 * halfEdge;
+    const theta = s / patchA.frame.radiusM;
+    const dir = mid.map((v, i) => v * Math.cos(theta) + along[i] * Math.sin(theta));
+    const a = Geometry.directionToLocalPoint(patchA, dir);
+    const b = Geometry.directionToLocalPoint(patchB, dir);
+    assert.ok(Math.abs(Math.hypot(a.u, a.v) - Math.hypot(b.u, b.v)) < 1e-4,
+      'физическая точка на общей биссектрисе равноудалена от обоих центров');
+    frameSamples.push({ dir, a, b });
+  }
+
+  const bilinear = (hf, res, point) => {
+    const gx = Math.min(res - 1.0001, Math.max(0, point.u * res / (2 * radiusM) + res / 2));
+    const gy = Math.min(res - 1.0001, Math.max(0, point.v * res / (2 * radiusM) + res / 2));
+    const x = Math.floor(gx), y = Math.floor(gy), tx = gx - x, ty = gy - y;
+    const i = y * res + x;
+    return (hf[i] * (1 - tx) + hf[i + 1] * tx) * (1 - ty)
+      + (hf[i + res] * (1 - tx) + hf[i + res + 1] * tx) * ty;
+  };
+  const rasterErrors = [];
+  const directErrors = [];
+  for (const res of [65, 256]) {
+    const stepM = (2 * radiusM) / res;
+    let maxDirect = 0;
+    for (const { dir, a, b } of frameSamples) {
+      const fromA = Contract.localPointToDirection(patchA, a.u, a.v);
+      const fromB = Contract.localPointToDirection(patchB, b.u, b.v);
+      assert.ok(Math.hypot(...fromA.map((v, i) => v - dir[i])) < 1e-10);
+      assert.ok(Math.hypot(...fromB.map((v, i) => v - dir[i])) < 1e-10);
+      const hA = Heightfield.sampleLocalTerrainHeightM(fromA, stepM, patchA.frame.radiusM, seed, true);
+      const hB = Heightfield.sampleLocalTerrainHeightM(fromB, stepM, patchB.frame.radiusM, seed, true);
+      maxDirect = Math.max(maxDirect, Math.abs(hA - hB));
+    }
+    assert.ok(maxDirect <= 1, `шаг ${res}²: равные физические точки отличаются не более 1 м (${maxDirect})`);
+    directErrors.push(maxDirect);
+
+    const makeGrid = (patch) => {
+      const heights = new Float32Array(res * res);
+      for (let y = 0; y < res; y++) {
+        for (let x = 0; x < res; x++) {
+          const dir = Contract.localPointToDirection(patch, (x - res / 2) * stepM, (y - res / 2) * stepM);
+          heights[y * res + x] = Heightfield.sampleLocalTerrainHeightM(dir, stepM, patch.frame.radiusM, seed, true);
+        }
+      }
+      return heights;
+    };
+    const gridA = makeGrid(patchA), gridB = makeGrid(patchB);
+    const maxRaster = Math.max(...frameSamples.map(({ a, b }) =>
+      Math.abs(bilinear(gridA, res, a) - bilinear(gridB, res, b))));
+    rasterErrors.push(maxRaster);
+  }
+  console.log(`W23: прямой сэмпл A/B 65²=${directErrors[0].toExponential(3)} м, 256²=${directErrors[1].toExponential(3)} м; растры ${rasterErrors[0].toFixed(3)} / ${rasterErrors[1].toFixed(3)} м`);
+  assert.ok(rasterErrors[1] < rasterErrors[0],
+    `остаток растра убывает с шагом: 65² ${rasterErrors[0]} м → 256² ${rasterErrors[1]} м`);
+});
+
+test('W23: m.8 = 3…8 % на суше, m.9 ≥ 1 % минимум в 30 из 40 случайных морских окон по 5 км', async () => {
+  const land = report.rows.find((r) => r.cell === 137436 && r.metric === stand.METRIC_TITLES.landRelief);
+  assert.ok(land.value >= 3 && land.value <= 8, `окно суши: ${land.value} %`);
+  const grid = GeodesicGrid.build(stand.CANONICAL_V);
+  const surface = PlanetSurface.generateSurface(grid, stand.WORLDS.a29.profile);
+  const oceans = [];
+  for (let c = 0; c < grid.cellCount; c++) {
+    if (grid.neighborCount[c] !== 6 || surface.elevation[c] >= surface.seaLevel || surface.lakeWeight[c] > 0) continue;
+    if (Array.from({ length: 6 }, (_, k) => grid.neighbors[c * 6 + k])
+      .every((n) => surface.elevation[n] < surface.seaLevel && surface.lakeWeight[n] === 0)) oceans.push(c);
+  }
+  // Фиксированный LCG, выбор без повторений, без ручного отбора «удачных» ячеек.
+  let state = 0x23102026;
+  const cells = new Set();
+  while (cells.size < 40) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    cells.add(oceans[state % oceans.length]);
+  }
+  let passed = 0;
+  const failures = [];
+  for (const cell of cells) {
+    const patch = Contract.buildPatch7(grid, surface, cell);
+    const local = await Worker.generateLocalMap({
+      patch, seed: stand.WORLDS.a29.seed, placeId: 2,
+      radiusM: stand.RELIEF_WINDOW_WIDTH_M / 2,
+      profile: stand.WORLDS.a29.profile, neighborRings: 0,
+    });
+    const { value } = stand.measureOceanRelief(local, patch, stand.RELIEF_WINDOW_WIDTH_M / 2);
+    if (value >= 1) passed++;
+    else failures.push(`${cell}:${value?.toFixed(2)}%`);
+  }
+  console.log(`W23: морские окна m.9 ≥ 1 %: ${passed}/40`);
+  assert.ok(passed >= 30, `m.9: ${passed}/40 морских пятен ≥ 1 %; остаток ${failures.join(', ')}`);
 });

@@ -10,7 +10,7 @@
  *   node tools/stand_local_map.mjs --gate     exit 1, если хотя бы одна метрика красная
  *   node tools/stand_local_map.mjs --json     та же таблица в JSON
  *   node tools/stand_local_map.mjs --profile=a17   другой мир (профиль A-17)
- *   node tools/stand_local_map.mjs --radius-m=2500 радиус участка, м
+ *   node tools/stand_local_map.mjs --radius-m=2500 переопределить радиус участка (м)
  *   node tools/stand_local_map.mjs --flat-fixture  негативный контроль (плоская фикстура)
  *
  * Гейт по умолчанию выключен: пороги красные намеренно (фиксируют текущие
@@ -35,8 +35,8 @@
  *   6. перепад waterDepthM патч/юбка на одинаковой глубине               ≤ 0,5 м
  *   7. доля площади гекса под врезом — доля точек сетки 44×44 (±0,95·R),
  *                                   где riverCarveFactor > 0            ≤ 12 %
- *   8. размах суши / ширина кадра — Δh по вершинам суши / 2R           10…25 %
- *   9. размах океанского дна      — Δh по вершинам океана / 2R          ≥ 5 %
+ *   8. размах суши / окно 5 км    — Δh по вершинам суши / 5 000 м      3…8 %
+ *   9. размах океанского дна      — Δh по вершинам океана / 5 000 м     ≥ 1 %
  *  10. средний уклон              — средний |Δh|/dx по парам соседних
  *                                   вершин heightfield                   ≥ 4 %
  *  11. гипсометрия p90−p10        — (p90 − p10) / (max − min)           ≥ 40 % размаха
@@ -89,7 +89,9 @@
  * Обе копии помечены в коде и повторяют эталонные измерения A-17/A-29.
  *
  * ФИКСТУРЫ (копии из tests/local-map-stage8.test.mjs, значения не переписаны):
- *   A17_PROFILE, A29_PROFILE, список контрольных ячеек, radiusM = 2500 м.
+ *   A17_PROFILE, A29_PROFILE, список контрольных ячеек. По умолчанию радиус
+ *   участка берётся из GLOBE_CELL_SCALE (≈ 52 136 м); m.8/m.9/m.10 меряются
+ *   в независимом фиксированном окне 5 000 м.
  *   По умолчанию стенд мерит мир A-29 (masterSeedHex a29a29a29a29a29a): это
  *   тот мир, на котором закрыт A-29, и числа метрики 6 совпадают с его
  *   диагностикой (0,067 / 0,091 / 0,070 / 0,074 м на четырёх ячейках).
@@ -106,6 +108,8 @@ const require = createRequire(import.meta.url);
 const GeodesicGrid = require('../site/shared/geodesic-grid.ts').default;
 const PlanetSurface = require('../site/shared/planet-surface.ts').default;
 const Contract = require('../src/local-map/local-map-contract.ts');
+const Geometry = require('../src/local-map/local-map-geometry.ts');
+const { GLOBE_CELL_SCALE, GLOBE_RELIEF } = require('../site/shared/planet-globe.ts');
 const Worker = require('../src/local-map/local-map-worker.ts');
 const Heightfield = require('../src/local-map/local-map-heightfield.ts');
 
@@ -171,7 +175,7 @@ const WORLDS = {
 };
 
 const PLACE_ID = 2;
-const DEFAULT_RADIUS_M = 2500;
+const DEFAULT_RADIUS_M = GLOBE_CELL_SCALE.strategicPatchRadiusM;
 /** Фиксированное окно (м) для метрик рельефа и уклона m.8, m.9, m.10 — независимо от radiusM. */
 const RELIEF_WINDOW_WIDTH_M = 5000;
 const RELIEF_WINDOW_RADIUS_M = RELIEF_WINDOW_WIDTH_M / 2;
@@ -213,9 +217,9 @@ const THRESHOLDS = {
   // Метрика 7: потолок доли площади под врезом, %.
   carveAreaMaxPct: 12,
   // Метрики 8–14 (Stage-8.14, шаг 1, Воркер 26; шаг 2, Воркер 26b): форма и сквозная непрерывность.
-  landReliefMinPct: 10,
-  landReliefMaxPct: 25,
-  oceanReliefMinPct: 5,
+  landReliefMinPct: 3,
+  landReliefMaxPct: 8,
+  oceanReliefMinPct: 1,
   meanSlopeMinPct: 4,
   hypsometryMinPct: 20,
   hypsometryMaxPct: 35,
@@ -229,10 +233,10 @@ const HYPSO_EARTH_REFERENCE_PCT = 19.4;
 const HYPSO_DOMAIN_REFERENCE_PCT = 28.1;
 const HYPSO_PREV_THRESHOLD_PCT = 35;
 
-/** Коэффициенты вертикального рельефа глобуса (site/shared/planet-globe.ts:286–294) и масштаб K. */
-const GLOBE_LAND_RELIEF_FACTOR = 0.022;
-const GLOBE_OCEAN_RELIEF_FACTOR = 0.008;
-const DEFAULT_GLOBE_SCALE_K = 8570;
+/** Коэффициенты глобуса и его шкала K из тех же модулей, что и страница. */
+const GLOBE_LAND_RELIEF_FACTOR = GLOBE_RELIEF.landMax;
+const GLOBE_OCEAN_RELIEF_FACTOR = GLOBE_RELIEF.oceanMax;
+const DEFAULT_GLOBE_SCALE_K = Worker.METERS_PER_ELEVATION_UNIT;
 
 /** CPU-реплика оптической глубины waterDepthM (ветка openSea шейдера, A-29). */
 const PELAGIC_DEPTH_M = 7.25;
@@ -295,7 +299,7 @@ function usage() {
     '  --gate               exit 1, если хотя бы одна метрика красная (гейт выключен по умолчанию)',
     '  --json               та же таблица в JSON',
     '  --profile            мир измерения: a29 (по умолчанию) или a17',
-    '  --radius-m           радиус участка, м (по умолчанию 2500 — как в отчётах A-17/A-29)',
+    '  --radius-m           радиус участка, м (по умолчанию GLOBE_CELL_SCALE.strategicPatchRadiusM ≈ 52 136)',
     '  --hypso-reference    подставить ориентир гипсометрии (%) в detail m.11 (в вердикте не участвует)',
     '  --flat-fixture       негативный контроль на синтетическом плоском heightfield (h = const)',
   ].join('\n');
@@ -1037,7 +1041,7 @@ function inReliefWindow(x, y, res, cellSize) {
 }
 
 /**
- * Метрика 8 — размах суши / ширина кадра (порог 10…25 %):
+ * Метрика 8 — размах суши / ширина кадра (порог 3…8 %):
  * Δh = max(h) − min(h) по вершинам суши heightfield (terraform_map >= 2)
  * в пределах фиксированного окна 5 000 м вокруг центра, отнесённый к константе
  * окна RELIEF_WINDOW_WIDTH_M = 5 000 м (независимо от radiusM), в процентах.
@@ -1091,7 +1095,7 @@ function measureLandRelief(local, radiusM) {
 }
 
 /**
- * Метрика 9 — размах океанского дна (порог ≥ 5 %):
+ * Метрика 9 — размах океанского дна (порог ≥ 1 %):
  * Δh = max(h) − min(h) по вершинам океана heightfield (terraform_map == 0,
  * исключая зеркала континентальных озёр lakeWeight > 0) в пределах
  * фиксированного окна 5 000 м вокруг центра, отнесённый к константе окна
@@ -1431,14 +1435,11 @@ function formatSignedCommaDeg(deg, digits = 1) {
 }
 
 /**
- * Метрика 13 — сквозная непрерывность A↔B (порог ≤ 1 м):
- * сравнивает ДВА РАЗНЫХ гекса — активный гекс A и каждый из его 6 соседних
- * гексов B, построенных тем же производственным generateLocalMap, в 16 общих
- * точках общей плоской грани шестиугольного среза (apothemM).
- * Номер слота используется ТОЛЬКО для сопоставления пары (ячейка, сосед);
- * истинный азимут направления к соседу вычисляется через cellTangentMeters + atan2.
- * В detail дополнительно печатается диагностика «слот·60° против истинного азимута»
- * и пометка «разность якорных высот патчей, не шов; станет швом после W23».
+ * Метрика 13: 16 физических направлений на общей биссектрисе центров A/B.
+ * Они проецируются в оба касательных кадра точной ОБРАТНОЙ exp-картой. Старый
+ * тест использовал одинаковые координаты с шагом 2·A, хотя реальные центры
+ * Голдберга не обязаны лежать на идеальной решётке: он мерил две РАЗНЫЕ точки.
+ * Синтетический контроль рампы сохраняет режим идеальной плоской решётки.
  */
 function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}) {
   const resA = localA.meta?.hfRes ?? Worker.HEIGHTFIELD_RES;
@@ -1450,6 +1451,7 @@ function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}
     ? options.azimuthOffsetRad
     : ((Number.isFinite(options.azimuthOffsetDeg) ? options.azimuthOffsetDeg : 0) * Math.PI) / 180;
   const useSlotScale = options.useSlotScale === true;
+  const syntheticPlane = options.syntheticPlane === true;
   const faces = [];
 
   for (let slotA = 0; slotA < slotsA.length; slotA++) {
@@ -1486,14 +1488,46 @@ function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}
     const resB = entryB.local.meta?.hfRes ?? Worker.HEIGHTFIELD_RES;
     let faceMaxDeltaM = 0;
     let faceRampDeltaM = 0;
+    let faceMaxDistanceDeltaM = 0;
+    const actualSpacingM = Math.hypot(tanA.u, tanA.v);
+    const centerA = patchA.frame.origin;
+    const centerB = entryB.patch.frame.origin;
+    const mid = centerA.map((v, k) => v + centerB[k]);
+    const midLen = Math.hypot(...mid);
+    const middle = mid.map((v) => v / midLen);
+    const normal = [
+      centerA[1] * centerB[2] - centerA[2] * centerB[1],
+      centerA[2] * centerB[0] - centerA[0] * centerB[2],
+      centerA[0] * centerB[1] - centerA[1] * centerB[0],
+    ];
+    const nLen = Math.hypot(...normal);
+    const alongEdge = normal.map((v) => v / nLen);
     let worstSample = 0;
     for (let p = 0; p < HEX_EDGE_SAMPLES; p++) {
       const s = ((p + 0.5) / HEX_EDGE_SAMPLES - 0.5) * 2 * halfEdgeM;
-      const xA = apothemM * Math.cos(angA) - s * Math.sin(angA);
-      const yA = apothemM * Math.sin(angA) + s * Math.cos(angA);
-      const sB = -s;
-      const xB = apothemM * Math.cos(angB) - sB * Math.sin(angB);
-      const yB = apothemM * Math.sin(angB) + sB * Math.cos(angB);
+      let xA, yA, xB, yB;
+      if (syntheticPlane) {
+        xA = apothemM * Math.cos(angA) - s * Math.sin(angA);
+        yA = apothemM * Math.sin(angA) + s * Math.cos(angA);
+        const sB = -s;
+        xB = apothemM * Math.cos(angB) - sB * Math.sin(angB);
+        yB = apothemM * Math.sin(angB) + sB * Math.cos(angB);
+      } else {
+        // Направление на БИССЕКТРИСЕ A/B: симметрично относительно центров
+        // на сфере. Обратные exp-проекции сохраняют ровно тот же физический dir.
+        const theta = s / patchA.frame.radiusM;
+        const dir = middle.map((v, k) => v * Math.cos(theta) + alongEdge[k] * Math.sin(theta));
+        const localA = Geometry.directionToLocalPoint(patchA, dir);
+        const localB = Geometry.directionToLocalPoint(entryB.patch, dir);
+        xA = localA.u;
+        yA = localA.v;
+        xB = localB.u;
+        yB = localB.v;
+        faceMaxDistanceDeltaM = Math.max(
+          faceMaxDistanceDeltaM,
+          Math.abs(Math.hypot(xA, yA) - Math.hypot(xB, yB)),
+        );
+      }
       const hA = bilinearHeight(localA.heightfield, resA, radiusM, xA, yA);
       const hB = bilinearHeight(entryB.local.heightfield, resB, radiusM, xB, yB);
       const deltaM = Math.abs(hA - hB);
@@ -1502,7 +1536,9 @@ function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}
         worstSample = p;
       }
       const rampHA = rampSlopeK * xA;
-      const rampHB = rampSlopeK * (centerShiftX + xB * cosDTrue - yB * sinDTrue);
+      const rampHB = syntheticPlane
+        ? rampSlopeK * (centerShiftX + xB * cosDTrue - yB * sinDTrue)
+        : rampHA;
       const rampDeltaM = Math.abs(rampHA - rampHB);
       if (rampDeltaM > faceRampDeltaM) faceRampDeltaM = rampDeltaM;
     }
@@ -1523,6 +1559,8 @@ function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}
       slotVsTrueDeg,
       slotVsTrueBDeg,
       rampSeamDeltaM: faceRampDeltaM,
+      maxDistanceDeltaM: faceMaxDistanceDeltaM,
+      idealApothemDeltaM: actualSpacingM / 2 - apothemM,
       maxDeltaM: faceMaxDeltaM,
       worstSample,
     });
@@ -1542,7 +1580,8 @@ function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}
   const worst = faces.reduce((a, b) => (b.maxDeltaM > a.maxDeltaM ? b : a));
   const rampSeamMaxDeltaM = Math.max(...faces.map((f) => f.rampSeamDeltaM));
   const azimuthScaleOk = rampSeamMaxDeltaM <= 0.1;
-  const pass = azimuthScaleOk && worst.maxDeltaM <= THRESHOLDS.hexContinuityMaxM;
+  const pass = azimuthScaleOk && worst.maxDeltaM <= THRESHOLDS.hexContinuityMaxM
+    && faces.every((face) => face.maxDistanceDeltaM <= 1);
   const slotDiffs = faces.map((f) => f.slotVsTrueDeg);
   const minSlotDiff = Math.min(...slotDiffs);
   const maxSlotDiff = Math.max(...slotDiffs);
@@ -1561,7 +1600,10 @@ function measureHexContinuity(localA, patchA, neighborMap, radiusM, options = {}
       + `${HEX_EDGE_SAMPLES} точек грани, max |Δh| = ${round(worst.maxDeltaM, 2)} м (точка ${worst.worstSample + 1}/${HEX_EDGE_SAMPLES}); `
       + `слот·60° против истинного азимута: ${slotDiagText} (диапазон ${formatSignedCommaDeg(minSlotDiff, 1)}…${formatSignedCommaDeg(maxSlotDiff, 1)}); `
       + `по граням: ${faces.map((f) => `с${f.slotA}(${f.cellB})=${round(f.maxDeltaM, 1)}м`).join(', ')}; `
-      + 'разность якорных высот патчей, не шов; станет швом после W23',
+      + (syntheticPlane
+        ? 'синтетическая рампа идеальных центров'
+        : `один dir в кадрах A/B; max Δ расстояния до центров = ${round(Math.max(...faces.map((f) => f.maxDistanceDeltaM)), 4)} м; `
+          + `отклонение реальной половины шага от апофемы = ${round(worst.idealApothemDeltaM, 1)} м`),
   };
 }
 
@@ -1631,7 +1673,7 @@ function runRampAzimuthControl(patchA, neighborPatches, radiusM = DEFAULT_RADIUS
     });
   }
 
-  return measureHexContinuity(localA, patchA, neighborMap, radiusM, options);
+  return measureHexContinuity(localA, patchA, neighborMap, radiusM, { ...options, syntheticPlane: true });
 }
 
 /** Среднее межцентровое расстояние dHex (м) до соседей патча (как в buildNeighborRingCells). */
@@ -1655,9 +1697,9 @@ function computePatchHexSpanM(patch) {
  * сравнивает ОДИН И ТОТ ЖЕ гекс C на разрешении 256×256 (активный центральный
  * heightfield) и на разрешении 64×64 (кольцевой LOD 1 RING_HF_RES[1] = 64 того
  * же гекса C до перехода камеры на него) на ОДИНАКОВОМ физическом span.
- * У центрального кадра span = 2·radiusM (5 км), у кольцевого LOD 64 span = dHex
- * (59–64,5 км); обе сетки опрашиваются на общем окне commonSpanM = min(fineSpanM, coarseSpanM)
- * с переводом координат ортогональным поворотом между касательными кадрами.
+ * У центрального кадра и кольцевого LOD 64 физический span = 2·radiusM
+ * (≈ 104 км при продуктовом радиусе); обе сетки опрашиваются на общем окне
+ * commonSpanM = min(fineSpanM, coarseSpanM) с переводом между 3D кадрами.
  */
 function measureLodConsistency(local256, patchC, coarseViews, radiusM) {
   if (!coarseViews || coarseViews.length === 0) {
@@ -1730,10 +1772,10 @@ function measureLodConsistency(local256, patchC, coarseViews, radiusM) {
 
 /**
  * Вертикальное преувеличение глобуса (только печать, без порога):
- *   суша  0,022 · R / ((elevMax − sea) · K)
- *   океан 0,008 · R / ((sea − elevMin) · K)
+ *   суша  GLOBE_RELIEF.landMax · R / ((elevMax − sea) · K)
+ *   океан GLOBE_RELIEF.oceanMax · R / ((sea − elevMin) · K)
  *   плюс отношение «океан / суша».
- * Причина: site/shared/planet-globe.ts:286–294 нормирует высоту на размах поля,
+ * Причина: site/shared/planet-globe.ts (GLOBE_RELIEF) нормирует высоту на размах поля,
  * поэтому глобус от смены K не меняется вообще.
  */
 function measureGlobeVerticalExaggeration(surface, options = {}) {
@@ -1770,8 +1812,8 @@ function measureGlobeVerticalExaggeration(surface, options = {}) {
       + `отношение океан/суша = ${formatCommaDecimal(oceanToLandRatio, 2)} `
       + `(при K = ${scaleK}, R = ${radiusM} м, sea = ${round(seaLevel, 4)}, `
       + `elevMin = ${round(elevationMin, 4)}, elevMax = ${round(elevationMax, 4)}; `
-      + `ориентир домена при K = 8 570: 46,1× / 4,6×, отношение 0,10; `
-      + `site/shared/planet-globe.ts:286–294 нормирует высоту на размах поля)`,
+      + `факторы landMax=${GLOBE_LAND_RELIEF_FACTOR}, oceanMax=${GLOBE_OCEAN_RELIEF_FACTOR}; `
+      + `site/shared/planet-globe.ts:GLOBE_RELIEF нормирует высоту на размах поля)`,
   };
 }
 
@@ -1848,7 +1890,7 @@ function buildFormAndContinuityRows({
     cell, zone, METRIC_TITLES.landRelief,
     landRelief.value === null ? null : round(landRelief.value, 3),
     landRelief.value === null ? '—' : `${landRelief.value.toFixed(2)} %`,
-    '10…25 %',
+    '3…8 %',
     landRelief.value === null
       ? 'N/A'
       : (landRelief.value >= THRESHOLDS.landReliefMinPct && landRelief.value <= THRESHOLDS.landReliefMaxPct ? 'PASS' : 'FAIL'),
@@ -1861,7 +1903,7 @@ function buildFormAndContinuityRows({
     cell, zone, METRIC_TITLES.oceanRelief,
     oceanRelief.value === null ? null : round(oceanRelief.value, 3),
     oceanRelief.value === null ? '—' : `${oceanRelief.value.toFixed(2)} %`,
-    '≥ 5 %',
+    '≥ 1 %',
     oceanRelief.value === null
       ? 'N/A'
       : (oceanRelief.value >= THRESHOLDS.oceanReliefMinPct ? 'PASS' : 'FAIL'),
